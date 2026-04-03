@@ -9,7 +9,7 @@ description = "A beautiful CLI tool to see what's running on your ports — fram
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
-authors = [{ name = "Larsen Cundric" }]
+authors = [{ name = "Sagar Pal" }]
 keywords = [
     "cli",
     "port",
@@ -42,8 +42,8 @@ dependencies = [
 ports = "portwhisperer.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/larsencundric/port-whisperer"
-Repository = "https://github.com/larsencundric/port-whisperer"
+Homepage = "https://github.com/palsagar/port-whisperer"
+Repository = "https://github.com/palsagar/port-whisperer"
 
 [dependency-groups]
 dev = ["ruff", "ty"]
