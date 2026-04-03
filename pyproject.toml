@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "portwhisperer"
+version = "2.0.0"
+description = "A beautiful CLI tool to see what's running on your ports — framework detection, process info, and interactive management"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+authors = [{ name = "Larsen Cundric" }]
+keywords = [
+    "cli",
+    "port",
+    "ports",
+    "process",
+    "dev-server",
+    "lsof",
+    "developer-tools",
+    "terminal",
+    "framework-detection",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: System :: Monitoring",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "click>=8.1",
+    "rich>=13.0",
+]
+
+[project.scripts]
+ports = "portwhisperer.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/larsencundric/port-whisperer"
+Repository = "https://github.com/larsencundric/port-whisperer"
+
+[dependency-groups]
+dev = ["ruff", "ty"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
