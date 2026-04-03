@@ -27,6 +27,24 @@ from portwhisperer.scanner import (
 console = Console()
 
 
+class _PortGroup(click.Group):
+    """Custom group that allows `ports 3000` alongside subcommands.
+
+    Rewrites a leading integer argument to ``--whoisonport <n>`` so Click
+    doesn't confuse it with a subcommand name.
+    """
+
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        # If first arg isn't a subcommand or flag, try to treat it as a port number
+        if args and args[0] not in self.commands and not args[0].startswith("-"):
+            try:
+                int(args[0])
+                args = ["--whoisonport", args[0], *args[1:]]
+            except ValueError:
+                pass
+        return super().parse_args(ctx, args)
+
+
 def _is_docker_process(name: str) -> bool:
     """Return True when the process name belongs to the Docker family.
 
@@ -164,8 +182,7 @@ def _collapse_docker(processes: list[ProcessInfo]) -> list[ProcessInfo]:
     return [*non_docker, summary]
 
 
-@click.group(invoke_without_command=True)
-@click.argument("port", required=False, type=int)
+@click.group(cls=_PortGroup, invoke_without_command=True)
 @click.option(
     "--all",
     "-a",
@@ -175,21 +192,15 @@ def _collapse_docker(processes: list[ProcessInfo]) -> list[ProcessInfo]:
 )
 @click.option("--whoisonport", type=int, help="Show details for a specific port")
 @click.pass_context
-def main(
-    ctx: click.Context, port: int | None, show_all: bool, whoisonport: int | None
-) -> None:
+def main(ctx: click.Context, show_all: bool, whoisonport: int | None) -> None:
     """Port Whisperer — listen to your ports."""
-    # If a subcommand was invoked, let it handle things
     if ctx.invoked_subcommand is not None:
         return
 
-    # --whoisonport flag is an alias for passing a port number directly
-    target_port = whoisonport or port
-
-    if target_port is not None:
-        info = get_port_details(target_port)
+    if whoisonport is not None:
+        info = get_port_details(whoisonport)
         display_port_detail(info)
-        if info and click.confirm(f"  Kill process on :{target_port}?", default=False):
+        if info and click.confirm(f"  Kill process on :{whoisonport}?", default=False):
             success = kill_process(info.pid)
             if success:
                 console.print(f"\n  [green]✓ Killed PID {info.pid}[/]\n")
