@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import cast
 
 from rich import box
 from rich.console import Console
@@ -462,14 +463,14 @@ def display_clean_results(
     console.print()
 
 
-def display_watch_event(event_type: str, info: PortInfo | dict) -> None:  # type: ignore[type-arg]
+def display_watch_event(event_type: str, info: PortInfo | dict[str, int]) -> None:
     """Print a single watch-mode event line with a timestamp prefix.
 
     Parameters
     ----------
     event_type : str
         Either ``"new"`` for an opened port or ``"removed"`` for a closed one.
-    info : PortInfo | dict
+    info : PortInfo | dict[str, int]
         For ``"new"`` events, a :class:`~portwhisperer.scanner.PortInfo`.
         For ``"removed"`` events, a dict with a ``"port"`` key.
 
@@ -482,7 +483,7 @@ def display_watch_event(event_type: str, info: PortInfo | dict) -> None:  # type
     """
     timestamp = f"[dim]{datetime.now().strftime('%H:%M:%S')}[/]"
 
-    if event_type == "new":
+    if event_type == "new" and isinstance(info, PortInfo):
         fw = f" {format_framework(info.framework)}" if info.framework else ""
         proj = f" [blue][{info.project_name}][/]" if info.project_name else ""
         console.print(
@@ -490,8 +491,10 @@ def display_watch_event(event_type: str, info: PortInfo | dict) -> None:  # type
             f":[bold white]{info.port}[/] ← [white]{info.process_name}[/]{proj}{fw}"
         )
     elif event_type == "removed":
-        port = info["port"] if isinstance(info, dict) else info.port
-        console.print(f"  {timestamp} [red]▼ CLOSED[/] :[bold white]{port}[/]")
+        removed_info = cast(dict[str, int], info)
+        console.print(
+            f"  {timestamp} [red]▼ CLOSED[/] :[bold white]{removed_info['port']}[/]"
+        )
 
 
 def display_watch_header() -> None:
