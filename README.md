@@ -1,5 +1,9 @@
 # portwhisperer
 
+[![PyPI](https://img.shields.io/pypi/v/portwhisperer)](https://pypi.org/project/portwhisperer/)
+[![Python](https://img.shields.io/pypi/pyversions/portwhisperer)](https://pypi.org/project/portwhisperer/)
+[![License](https://img.shields.io/pypi/l/portwhisperer)](https://github.com/palsagar/port-whisperer/blob/main/LICENSE)
+
 **A beautiful CLI tool to see what's running on your ports.**
 
 Stop guessing which process is on port 3000. `portwhisperer` gives you a color-coded table of every dev server, database, and background process listening on your machine -- with framework detection, Docker container identification, and interactive process management.
@@ -30,15 +34,19 @@ Colors: green = healthy, yellow = orphaned, red = zombie.
 ## Install
 
 ```bash
-pip install portwhisperer
+uv tool install portwhisperer    # global install (recommended)
 ```
 
 ```bash
-uv tool install portwhisperer
+uv pip install portwhisperer     # into current virtual env
 ```
 
 ```bash
-pipx install portwhisperer
+pip install portwhisperer        # classic pip
+```
+
+```bash
+pipx install portwhisperer       # isolated global install
 ```
 
 Requires Python 3.12+.
