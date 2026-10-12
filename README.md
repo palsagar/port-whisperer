@@ -186,7 +186,7 @@ Intentional daemons are left out: processes started with `--daemon` and jobs man
 ports watch
 ```
 
-Prints the dev servers that are listening now, then one line each time a port opens, closes, or restarts under a new PID.
+Prints the dev servers that are listening now, then one line each time a port opens, closes, or restarts under a new PID. For a Docker port, a new container on the same port counts as a restart.
 
 ```
 $ ports watch
@@ -245,7 +245,7 @@ Shows only the ports whose server runs inside the current git repository. Outsid
 
 The banner prints only when stdout is a terminal. `ports | cat` prints the table alone.
 
-**JSON output.** `ports --json` prints an array of port objects; `ports <port> --json` prints one object. Each object holds every field the tool knows, such as `port`, `pid`, `process_name`, `tool`, `address`, `command`, `cwd`, `project_name`, `framework`, `status`, `container` and `image`. `start_time` is ISO 8601. `ports ps --json` lists Docker processes one by one instead of as one summary row. `ports watch --json` prints one object per line, with `event` (`snapshot`, `new`, `restarted` or `closed`) and `time` added to the port's fields.
+**JSON output.** `ports --json` prints an array of port objects; `ports <port> --json` prints one object. Each object holds every field the tool knows, such as `port`, `pid`, `process_name`, `tool`, `address`, `command`, `cwd`, `project_name`, `framework`, `status`, `container` and `image`. `start_time` is ISO 8601. `ports ps --json` lists Docker processes one by one instead of as one summary row. `ports watch --json` prints one object per line, with `event` (`snapshot`, `new`, `restarted` or `closed`) and `time` added to the port's fields. After the snapshot lines it prints `{"event": "ready", ...}`, even when no port is open.
 
 ```bash
 ports --json | jq '.[] | select(.address != "127.0.0.1") | .port'
@@ -278,7 +278,7 @@ dev_processes = ["air", "hugo"]
 ignore_processes = ["ollama"]
 ```
 
-- Names match the process name exactly, ignoring case. The PROCESS column shows the tool for interpreters, so use the interpreter name (for example `python3.13`) when you want to match one; `ports <port>` shows it.
+- Names match exactly, ignoring case. A name can be the process name (`python3.13`) or the tool name that the PROCESS column shows (`uvicorn`).
 - Your entries win over the built-in lists. A name in both of your lists is hidden.
 - The lists apply to `ports`, `ports ps`, `ports watch` and the detached check used by `ports clean`.
 - If the file has invalid TOML, an unknown key, or a value that is not a list of strings, `ports` prints one warning and uses the built-in lists.

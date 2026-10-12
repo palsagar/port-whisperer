@@ -48,10 +48,15 @@ class _PortGroup(click.Group):
     """
 
     def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
-        # If first arg isn't a subcommand or flag, try to treat it as a port number
-        if args and args[0] not in self.commands and not args[0].startswith("-"):
+        # Find the first argument that is not an option, so "ports --json 3000"
+        # works as well as "ports 3000 --json". --whoisonport is the only
+        # group option that takes a value.
+        i = 0
+        while i < len(args) and args[i].startswith("-"):
+            i += 2 if args[i] == "--whoisonport" else 1
+        if i < len(args) and args[i] not in self.commands:
             try:
-                port = int(args[0])
+                port = int(args[i])
             except ValueError:
                 pass
             else:
@@ -61,7 +66,7 @@ class _PortGroup(click.Group):
                         f"{port} is not a valid port. Use a number from 1 to 65535.",
                         ctx,
                     )
-                args = ["--whoisonport", args[0], *args[1:]]
+                args = [*args[:i], "--whoisonport", args[i], *args[i + 1 :]]
         return super().parse_args(ctx, args)
 
     def invoke(self, ctx: click.Context) -> object:

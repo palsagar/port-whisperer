@@ -413,12 +413,20 @@ def test_watch_json_prints_one_object_per_line(watch_calls, capsys):
     callback("snapshot", [_info(3000, 1), _info(4000, 2)])
     callback("restarted", _info(3000, 9))
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    assert [(e["event"], e["port"], e["pid"]) for e in events] == [
+    assert [(e["event"], e.get("port"), e.get("pid")) for e in events] == [
         ("snapshot", 3000, 1),
         ("snapshot", 4000, 2),
+        ("ready", None, None),
         ("restarted", 3000, 9),
     ]
-    assert "time" in events[0]
+    assert "time" in events[0] and "time" in events[2]
+
+
+def test_watch_json_empty_snapshot_still_says_ready(watch_calls, capsys):
+    CliRunner().invoke(cli.main, ["watch", "--json"])
+    watch_calls[0]["callback"]("snapshot", [])
+    (line,) = capsys.readouterr().out.splitlines()
+    assert json.loads(line)["event"] == "ready"
 
 
 def test_watch_routes_snapshot_and_events(monkeypatch, watch_calls):
@@ -526,3 +534,25 @@ def test_failed_scan_exits_3_and_never_claims_free(monkeypatch, args):
     assert result.exit_code == 3
     assert "Could not check the ports" in result.output
     assert "3000\n" not in result.output
+
+
+@pytest.mark.parametrize(
+    "args",
+    [["--json", "3000"], ["-q", "3000"], ["-q", "--json", "3000"], ["-a", "3000"]],
+)
+def test_flags_before_the_port(detail_calls, args):
+    CliRunner().invoke(cli.main, args)
+    assert detail_calls == [3000]
+
+
+def test_flag_before_invalid_port(detail_calls):
+    result = CliRunner().invoke(cli.main, ["--json", "70000"])
+    assert result.exit_code == 2
+    assert "70000 is not a valid port" in result.output
+
+
+def test_flag_before_subcommand_is_not_rewritten(watch_calls, detail_calls):
+    result = CliRunner().invoke(cli.main, ["-q", "watch"])
+    assert result.exit_code == 0, result.output
+    assert detail_calls == []
+    assert len(watch_calls) == 1

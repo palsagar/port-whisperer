@@ -993,11 +993,15 @@ def is_dev_process(name: str, command: str) -> bool:
     cmd = (command or "").lower()
 
     # The user's own lists come first, so they can correct any built-in entry
+    # The user's names may be the tool the tables show (uvicorn) or the
+    # process itself (python3.13)
     user_dev, user_ignored = _user_process_lists()
-    if n in user_ignored:
-        return False
-    if n in user_dev:
-        return True
+    if user_dev or user_ignored:
+        names = {n, (_detect_tool(command, name) or "").lower()} - {""}
+        if names & user_ignored:
+            return False
+        if names & user_dev:
+            return True
 
     # Known system/desktop apps — not dev processes
     system_apps = [
@@ -1177,11 +1181,13 @@ def get_listening_ports() -> list[PortInfo]:
             continue
         address, port = m.group(1), int(m.group(2))
 
-        # Keep the first entry per port, but the widest address of all its
-        # rows: reachability from the network is what the address is for
+        # Keep the first entry per port, with the widest address among that
+        # PID's rows (IPv4 and IPv6). Another PID's address is not its own.
         if port in by_port:
             entry = by_port[port]
-            if _address_rank(address) > _address_rank(entry["address"]):
+            if entry["pid"] == pid and _address_rank(address) > _address_rank(
+                entry["address"]
+            ):
                 entry["address"] = address
             continue
         by_port[port] = {
@@ -1587,8 +1593,10 @@ def container_engine(name: str, command: str = "") -> str | None:
         return "Lima"
     if name == "gvproxy":
         return "Podman"
-    # Lima (and so Colima) forwards ports over ssh with its own ssh config
-    if name == "ssh" and re.search(r"/\.lima/|/_lima/|/\.colima/", command):
+    # Lima (and so Colima and Rancher Desktop) forwards over ssh with the
+    # instance's own ssh.config, e.g. ~/.lima/default/ssh.config or
+    # ~/Library/Application Support/rancher-desktop/lima/0/ssh.config
+    if name == "ssh" and re.search(r"lima\S*/ssh\.config|/\.colima/", command, re.I):
         return "Lima"
     return None
 
@@ -1767,7 +1775,8 @@ def _socket_holders(path: str) -> dict[int, str] | None:
     Parameters
     ----------
     path : str
-        Path of the socket file.
+        Path of the socket file. lsof matches a Unix socket by the path it was
+        bound with, so both this path and its resolved form are checked.
 
     Returns
     -------
@@ -1784,7 +1793,16 @@ def _socket_holders(path: str) -> dict[int, str] | None:
     try:
         proc = subprocess.run(
             # -F pc prints "p<pid>" and "c<name>" lines; +c 0 keeps full names
-            ["lsof", "-w", "+c", "0", "-F", "pc", "--", os.path.realpath(path)],
+            [
+                "lsof",
+                "-w",
+                "+c",
+                "0",
+                "-F",
+                "pc",
+                "--",
+                *dict.fromkeys([path, os.path.realpath(path)]),
+            ],
             capture_output=True,
             text=True,
             timeout=5,
@@ -1892,9 +1910,10 @@ def _stop_container(info: PortInfo, force: bool) -> KillResult:
             info.port,
             info.pid,
             False,
-            f":{info.port} is held by {engine}, but the docker CLI talks to "
-            f"a different engine ({env['DOCKER_HOST']}). Nothing was stopped; "
-            "switch with docker context use",
+            f"could not confirm that the docker endpoint ({env['DOCKER_HOST']}) "
+            f"belongs to {engine}, which holds :{info.port}. Nothing was "
+            "stopped. If you run two engines, switch with docker context use; "
+            "otherwise stop the container with docker stop",
         )
     # Compare full IDs: a recreated container can reuse the old name
     current = _batch_docker_info(env).get(info.port)
@@ -2051,7 +2070,7 @@ def watch_ports(
     callback : Callable[[str, PortInfo | list[PortInfo]], None]
         Called once with ``("snapshot", list[PortInfo])`` for the ports open
         at the start, then with ``("new", PortInfo)``,
-        ``("restarted", PortInfo)`` (same port, new PID) or
+        ``("restarted", PortInfo)`` (same port, new PID or container) or
         ``("closed", PortInfo)`` (the last info seen for that port). A failed
         scan after the first one is skipped; the first one raises
         :class:`ScanError`.
@@ -2090,7 +2109,12 @@ def watch_ports(
             for port, info in current.items():
                 if port not in previous:
                     callback("new", info)
-                elif previous[port].pid != info.pid:
+                # A container port keeps the engine's PID, so a recreated
+                # container shows up only as a new container ID
+                elif (previous[port].pid, previous[port].container_id) != (
+                    info.pid,
+                    info.container_id,
+                ):
                     callback("restarted", info)
             for port, info in previous.items():
                 if port not in current:

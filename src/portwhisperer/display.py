@@ -693,8 +693,10 @@ def display_watch_header() -> None:
 def display_watch_json(event_type: str, data: PortInfo | list[PortInfo]) -> None:
     """Print watch events as JSON, one object per line.
 
-    The snapshot prints one ``"snapshot"`` line per open port. Each line holds
-    the port's fields plus ``event`` and ``time`` (ISO 8601).
+    The snapshot prints one ``"snapshot"`` line per open port, then one
+    ``{"event": "ready", "time": ...}`` line, so a reader knows the snapshot
+    is complete even when no port is open. Port lines hold the port's fields
+    plus ``event`` and ``time`` (ISO 8601).
 
     Parameters
     ----------
@@ -713,3 +715,5 @@ def display_watch_json(event_type: str, data: PortInfo | list[PortInfo]) -> None
     for info in [data] if isinstance(data, PortInfo) else data:
         line = {"event": event_type, "time": now, **dataclasses.asdict(info)}
         print(to_json(line, indent=None), flush=True)
+    if event_type == "snapshot":
+        print(to_json({"event": "ready", "time": now}, indent=None), flush=True)

@@ -490,10 +490,15 @@ def test_widest_address_wins(fake_run, frozen_now):
         "node  41000  dev  31u  IPv6 0x2  0t0  TCP *:9000 (LISTEN)\n"
         "node  41000  dev  32u  IPv4 0x3  0t0  TCP 127.0.0.1:9001 (LISTEN)\n"
         "node  41000  dev  33u  IPv6 0x4  0t0  TCP [::1]:9001 (LISTEN)\n"
+        # A different PID's wider address is not the listed process's own
+        "node  41000  dev  34u  IPv4 0x5  0t0  TCP 127.0.0.1:9002 (LISTEN)\n"
+        "node  41100  dev  35u  IPv4 0x6  0t0  TCP *:9002 (LISTEN)\n"
     )
     ports = {p.port: p for p in scanner.get_listening_ports()}
     assert ports[9000].address == "*"
     assert ports[9001].address == "127.0.0.1"
+    assert ports[9002].pid == 41000
+    assert ports[9002].address == "127.0.0.1"
 
 
 @pytest.mark.parametrize(
@@ -583,6 +588,14 @@ def test_config_ignore_beats_dev(no_user_config):
     assert not scanner.is_dev_process("ollama", "ollama serve")
 
 
+def test_config_matches_the_tool_name(no_user_config):
+    # The table shows "uvicorn", so that is the name a user will write
+    no_user_config.parent.mkdir(parents=True)
+    no_user_config.write_text('ignore_processes = ["uvicorn"]\n')
+    assert not scanner.is_dev_process("python3.13", "python3 .venv/bin/uvicorn a:b")
+    assert scanner.is_dev_process("python3.13", "python3 server.py")
+
+
 def test_config_can_show_a_blocked_app(no_user_config):
     no_user_config.parent.mkdir(parents=True)
     no_user_config.write_text('dev_processes = ["code"]\n')
@@ -668,6 +681,18 @@ def test_watch_snapshot_then_changes(monkeypatch):
 def test_watch_detects_restart_on_same_port(monkeypatch):
     events = _watch(monkeypatch, [[_p(3000, 1)], [_p(3000, 9)]])
     assert events == [("snapshot", [3000]), ("restarted", 9)]
+
+
+def test_watch_detects_recreated_container(monkeypatch):
+    # The engine's PID stays the same; only the container ID changes
+    old = _p(5432, 1500, "docker")
+    old.container_id = "aaa"
+    new = _p(5432, 1500, "docker")
+    new.container_id = "bbb"
+    assert _watch(monkeypatch, [[old], [new]]) == [
+        ("snapshot", [5432]),
+        ("restarted", 1500),
+    ]
 
 
 def test_watch_filters_to_dev_processes(monkeypatch):

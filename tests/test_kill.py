@@ -436,6 +436,13 @@ COLIMA_SSH = "ssh -F /Users/dev/.colima/_lima/colima/ssh.config -L 5432:x lima-c
         ("OrbStack Helper", "", "OrbStack"),
         ("limactl", "limactl hostagent colima", "Lima"),
         ("ssh", COLIMA_SSH, "Lima"),
+        ("ssh", "ssh -F /Users/dev/.lima/default/ssh.config lima-default", "Lima"),
+        (
+            "ssh",
+            "ssh -F /Users/dev/Library/Application Support/rancher-desktop/lima/0"
+            "/ssh.config lima-0",
+            "Lima",
+        ),
         ("Rancher Desktop", "", "Rancher Desktop"),
         ("gvproxy", "", "Podman"),
         # An ordinary ssh tunnel is the user's own and may be killed
@@ -493,7 +500,7 @@ def test_desktop_port_with_colima_context_stops_nothing(monkeypatch, fake_run, s
     assert fake_run.commands("docker stop") == []
     assert signals == []
     assert not result.ok
-    assert "different engine" in result.detail
+    assert "could not confirm" in result.detail
 
 
 def test_docker_cli_client_on_the_socket_does_not_count(monkeypatch, fake_run, signals):
@@ -543,8 +550,9 @@ def test_socket_check_resolves_symlinks(monkeypatch, fake_run, signals, tmp_path
     stopped = lambda: fake_run.commands("docker stop")  # noqa: E731
     _listeners(monkeypatch, lambda: set() if stopped() else {1500})
     assert scanner.free_port(_backend()).ok
+    # lsof matches a socket by the path it was bound with, so ask for both
     (call,) = fake_run.commands("-F pc")
-    assert call.endswith(f"-- {real.resolve()}")
+    assert call.endswith(f"-- {link} {real.resolve()}")
 
 
 def test_ssh_without_command_is_looked_up_again(monkeypatch, fake_run, signals):
