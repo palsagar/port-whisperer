@@ -77,8 +77,7 @@ def _batch_ps_info(pids: list[int]) -> dict[int, dict]:
     pid_list = ",".join(str(p) for p in pids)
     try:
         proc = subprocess.run(
-            f"ps -p {pid_list} -o pid=,ppid=,stat=,rss=,lstart=,command=",
-            shell=True,
+            ["ps", "-p", pid_list, "-o", "pid=,ppid=,stat=,rss=,lstart=,command="],
             capture_output=True,
             text=True,
             timeout=5,
@@ -101,7 +100,11 @@ def _batch_ps_info(pids: list[int]) -> dict[int, dict]:
                 "lstart": m.group(5),
                 "command": m.group(6),
             }
-    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+    except (
+        subprocess.TimeoutExpired,
+        subprocess.CalledProcessError,
+        FileNotFoundError,
+    ):
         pass
     return result
 
@@ -133,8 +136,7 @@ def _batch_cwd(pids: list[int]) -> dict[int, str]:
     pid_list = ",".join(str(p) for p in pids)
     try:
         proc = subprocess.run(
-            f"lsof -a -d cwd -p {pid_list}",
-            shell=True,
+            ["lsof", "-a", "-d", "cwd", "-p", pid_list],
             capture_output=True,
             text=True,
             timeout=10,
@@ -148,7 +150,11 @@ def _batch_cwd(pids: list[int]) -> dict[int, str]:
             path = " ".join(parts[8:])
             if path and path.startswith("/"):
                 result[pid] = path
-    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+    except (
+        subprocess.TimeoutExpired,
+        subprocess.CalledProcessError,
+        FileNotFoundError,
+    ):
         pass
     return result
 
@@ -171,8 +177,7 @@ def _batch_docker_info() -> dict[int, dict]:
     result: dict[int, dict] = {}
     try:
         proc = subprocess.run(
-            'docker ps --format "{{.Ports}}\\t{{.Names}}\\t{{.Image}}"',
-            shell=True,
+            ["docker", "ps", "--format", "{{.Ports}}\\t{{.Names}}\\t{{.Image}}"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -193,7 +198,11 @@ def _batch_docker_info() -> dict[int, dict]:
                 if port not in seen:
                     seen.add(port)
                     result[port] = {"name": name, "image": image}
-    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+    except (
+        subprocess.TimeoutExpired,
+        subprocess.CalledProcessError,
+        FileNotFoundError,
+    ):
         pass
     return result
 
@@ -594,8 +603,7 @@ def _get_process_tree(pid: int) -> list[dict]:
     tree: list[dict] = []
     try:
         proc = subprocess.run(
-            "ps -eo pid=,ppid=,comm=",
-            shell=True,
+            ["ps", "-eo", "pid=,ppid=,comm="],
             capture_output=True,
             text=True,
             timeout=5,
@@ -618,7 +626,11 @@ def _get_process_tree(pid: int) -> list[dict]:
             tree.append(proc_info)
             current_pid = proc_info["ppid"]
             depth += 1
-    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+    except (
+        subprocess.TimeoutExpired,
+        subprocess.CalledProcessError,
+        FileNotFoundError,
+    ):
         pass
     return tree
 
@@ -644,14 +656,19 @@ def _get_git_branch(directory: str) -> str | None:
     """
     try:
         git_proc = subprocess.run(
-            f'git -C "{directory}" rev-parse --abbrev-ref HEAD',
-            shell=True,
+            # Argument list, not a shell string: the directory comes from lsof
+            # and may contain quotes or $(...)
+            ["git", "-C", directory, "rev-parse", "--abbrev-ref", "HEAD"],
             capture_output=True,
             text=True,
             timeout=3,
         )
         return git_proc.stdout.strip() or None
-    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+    except (
+        subprocess.TimeoutExpired,
+        subprocess.CalledProcessError,
+        FileNotFoundError,
+    ):
         return None
 
 
@@ -853,14 +870,17 @@ def get_listening_ports() -> list[PortInfo]:
     try:
         proc = subprocess.run(
             # +c 0 stops lsof from cutting process names to 9 characters
-            "lsof +c 0 -iTCP -sTCP:LISTEN -P -n",
-            shell=True,
+            ["lsof", "+c", "0", "-iTCP", "-sTCP:LISTEN", "-P", "-n"],
             capture_output=True,
             text=True,
             timeout=10,
         )
         raw = proc.stdout
-    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+    except (
+        subprocess.TimeoutExpired,
+        subprocess.CalledProcessError,
+        FileNotFoundError,
+    ):
         return []
 
     lines = raw.strip().splitlines()
@@ -982,14 +1002,17 @@ def get_all_processes() -> list[ProcessInfo]:
     """
     try:
         proc = subprocess.run(
-            "ps -eo pid=,pcpu=,pmem=,rss=,lstart=,command=",
-            shell=True,
+            ["ps", "-eo", "pid=,pcpu=,pmem=,rss=,lstart=,command="],
             capture_output=True,
             text=True,
             timeout=5,
         )
         raw = proc.stdout.strip()
-    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+    except (
+        subprocess.TimeoutExpired,
+        subprocess.CalledProcessError,
+        FileNotFoundError,
+    ):
         return []
 
     entries: list[dict] = []

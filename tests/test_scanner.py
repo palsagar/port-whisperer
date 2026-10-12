@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -69,7 +70,7 @@ def test_decode_lsof_name(raw, expected):
 def test_lsof_asks_for_full_names(fake_run):
     scanner.get_listening_ports()
     (listen_call,) = fake_run.commands("-sTCP:LISTEN")
-    assert "+c 0" in str(listen_call)
+    assert "+c 0" in listen_call
 
 
 def test_command_comes_from_ps(ports):
@@ -231,7 +232,7 @@ def test_all_processes_framework_and_cwd(processes, project_root: Path):
 def test_all_processes_skip_docker_cwd(fake_run, frozen_now):
     scanner.get_all_processes()
     (cwd_call,) = fake_run.commands("-d cwd")
-    assert "126,23928,41000" in str(cwd_call)
+    assert cwd_call.endswith("-p 126,23928,41000")
 
 
 def test_all_processes_skip_own_pid(fake_run, frozen_now, monkeypatch):
@@ -371,3 +372,32 @@ def test_detect_framework_from_image(image, expected):
 )
 def test_is_dev_process(name, command, expected):
     assert scanner.is_dev_process(name, command) is expected
+
+
+# ── subprocess safety ─────────────────────────────────────────────────────────
+
+
+def test_every_call_is_an_argument_list(fake_run, frozen_now):
+    scanner.get_port_details(8012)
+    scanner.get_all_processes()
+    assert fake_run.calls
+    assert all(isinstance(call, list) for call in fake_run.calls)
+
+
+def test_git_directory_is_one_argument(fake_run):
+    # A hostile directory name must reach git untouched, never a shell
+    directory = '/tmp/a"b/$(touch pwned)'
+    assert scanner._get_git_branch(directory) == "main"
+    assert fake_run.calls == [
+        ["git", "-C", directory, "rev-parse", "--abbrev-ref", "HEAD"]
+    ]
+
+
+def test_missing_binaries(monkeypatch):
+    def missing(args, **kwargs):
+        raise FileNotFoundError(args[0])
+
+    monkeypatch.setattr(subprocess, "run", missing)
+    assert scanner._batch_docker_info() == {}
+    assert scanner._get_git_branch("/tmp") is None
+    assert scanner.get_listening_ports() == []

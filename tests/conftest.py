@@ -28,8 +28,8 @@ NOW = datetime(2026, 10, 12, 12, 0, 0)
 class FakeRun:
     """Stand-in for ``subprocess.run`` that serves fixture text by command.
 
-    Accepts both the string form (``shell=True``) and the argument-list form,
-    and records every call so tests can count them.
+    Matches on the space-joined argument list, records every call so tests
+    can count them, and fails any call made with ``shell=True``.
 
     Examples
     --------
@@ -47,13 +47,14 @@ class FakeRun:
         }
         self.outputs["git"] = "main\n"
 
-    def commands(self, needle: str) -> list[str | list[str]]:
-        """Return the recorded calls whose joined command contains ``needle``."""
-        return [c for c in self.calls if needle in _joined(c)]
+    def commands(self, needle: str) -> list[str]:
+        """Return the recorded commands, joined, that contain ``needle``."""
+        return [cmd for cmd in map(_joined, self.calls) if needle in cmd]
 
     def __call__(
         self, args: str | list[str], **kwargs: object
     ) -> subprocess.CompletedProcess[str]:
+        assert not kwargs.get("shell"), "scanner must not run commands in a shell"
         self.calls.append(args)
         cmd = _joined(args)
         if cmd.startswith("git"):
