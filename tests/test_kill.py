@@ -204,3 +204,51 @@ def test_listening_ports_fill_ppid_and_container(fake_run, frozen_now):
     assert ports[3001].ppid == 40990
     assert ports[5432].container == "dev-postgres"
     assert ports[3000].container is None
+
+
+# ── review fixes ──────────────────────────────────────────────────────────────
+
+
+def test_container_only_for_docker_processes(fake_run, frozen_now):
+    # A native postgres row on :5432 must not inherit the container's name,
+    # or ports kill 5432 would stop an unrelated container
+    header, docker_row, rest = fake_run.outputs["lsof_listen.txt"].split("\n", 2)
+    native = "postgres  2000  dev  7u  IPv4 0x1  0t0  TCP 127.0.0.1:5432 (LISTEN)"
+    # Docker still listens on another port, so docker ps runs
+    other = docker_row.replace("*:5432", "*:6379")
+    fake_run.outputs["lsof_listen.txt"] = "\n".join(
+        [header, native, docker_row, other, rest]
+    )
+    ports = {p.port: p for p in scanner.get_listening_ports()}
+    assert ports[5432].pid == 2000
+    assert ports[5432].container is None
+
+
+def test_pid_no_longer_listening_gets_no_signal(monkeypatch, signals):
+    # The server exited during the prompt; its PID may now belong to someone else
+    _listeners(monkeypatch, lambda: {50000})
+    result = scanner.free_port(_node())
+    assert signals == []
+    assert not result.ok
+
+
+def test_other_listener_from_before_is_not_called_a_restart(monkeypatch, signals):
+    # Prefork servers: several PIDs already shared the socket before the kill
+    _listeners(monkeypatch, lambda: {50000} if signals else {41000, 50000})
+    result = scanner.free_port(_node())
+    assert signals == [(41000, signal.SIGTERM)]
+    assert not result.ok
+    assert "restarted" not in result.detail
+    assert "50000" in result.detail
+
+
+def test_docker_stderr_control_characters_are_removed(monkeypatch, signals):
+    def failing(args: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(args, 1, "", "bad\x1b[2Jthing\x07")
+
+    monkeypatch.setattr(subprocess, "run", failing)
+    _listeners(monkeypatch, lambda: {1500})
+    info = _node(port=5432, pid=1500, raw_name="com.docker.backend", container="pg")
+    detail = scanner.free_port(info).detail
+    assert "\x1b" not in detail
+    assert "\x07" not in detail

@@ -975,7 +975,9 @@ def get_listening_ports() -> list[PortInfo]:
             info.framework = _detect_framework_from_command(ps["command"], process_name)
 
         # Docker container overrides
-        docker = docker_map.get(port)
+        # Only Docker's own listener stands for a container. A native server
+        # that shares the port number must not inherit the container's name.
+        docker = docker_map.get(port) if is_docker_process(process_name) else None
         if docker:
             info.project_name = docker["name"]
             info.container = docker["name"]
@@ -1177,8 +1179,9 @@ def find_clean_candidates() -> list[PortInfo]:
     daemons. A detached process counts as a daemon, and is left out, when:
 
     - its command line contains ``--daemon``, or
-    - launchd manages it (its PID is in ``launchctl list``), as with
-      ``brew services``.
+    - launchd manages it for this user (its PID is in ``launchctl list``),
+      as with ``brew services``. Jobs started with ``sudo brew services``
+      belong to root's launchd domain and are not detected.
 
     pm2 needs no rule: its processes are children of the pm2 daemon, not of
     PID 1, so they are never detached.
@@ -1317,13 +1320,15 @@ def _wait_for_release(port: int, pid: int, timeout: float) -> bool:
         time.sleep(_POLL_INTERVAL)
 
 
-def _port_free_result(info: PortInfo) -> KillResult:
+def _port_free_result(info: PortInfo, before: set[int] | None = None) -> KillResult:
     """Build the final result from one last look at the port.
 
     Parameters
     ----------
     info : PortInfo
         The port that was targeted.
+    before : set[int] | None
+        PIDs that listened on the port before the kill, if known.
 
     Returns
     -------
@@ -1347,8 +1352,14 @@ def _port_free_result(info: PortInfo) -> KillResult:
         return KillResult(info.port, info.pid, True, "port is free")
     if info.pid in listeners:
         return fail(f"PID {info.pid} still listens on :{info.port}")
-    # The old process is gone but something restarted the server
     others = ", ".join(str(p) for p in sorted(listeners))
+    if before and listeners <= before:
+        # Prefork servers share one socket across several PIDs
+        return fail(
+            f"PID {others} also listened on :{info.port} and is still running. "
+            f"Run ports kill {info.port} again to stop it"
+        )
+    # The old process is gone but something restarted the server
     return fail(
         f"PID {info.pid} stopped, but PID {others} took :{info.port} again. "
         "A parent watcher (nodemon, npm run dev) probably restarted it"
@@ -1393,7 +1404,9 @@ def _stop_container(info: PortInfo, force: bool) -> KillResult:
             info.port, info.pid, False, f"docker {action} {name} timed out"
         )
     if proc.returncode != 0:
-        error = proc.stderr.strip() or f"exit code {proc.returncode}"
+        # Drop control characters so docker's output cannot drive the terminal
+        error = re.sub(r"[\x00-\x1f\x7f]", "", proc.stderr.strip())
+        error = error or f"exit code {proc.returncode}"
         return KillResult(
             info.port, info.pid, False, f"docker {action} {name} failed: {error}"
         )
@@ -1453,6 +1466,12 @@ def free_port(info: PortInfo, force: bool = False) -> KillResult:
             "docker CLI installed?)",
         )
 
+    # Signal only a PID that still holds the port. After a long prompt the
+    # server may be gone and its PID reused by an unrelated process.
+    before = _port_listener_pids(info.port)
+    if before is None or info.pid not in before:
+        return _port_free_result(info, before)
+
     steps = [signal.SIGKILL] if force else [signal.SIGTERM, signal.SIGKILL]
     for sig in steps:
         try:
@@ -1469,7 +1488,7 @@ def free_port(info: PortInfo, force: bool = False) -> KillResult:
         timeout = _TERM_TIMEOUT if sig == signal.SIGTERM else _KILL_TIMEOUT
         if _wait_for_release(info.port, info.pid, timeout):
             break
-    return _port_free_result(info)
+    return _port_free_result(info, before)
 
 
 def watch_ports(callback: Callable, interval: float = 2.0) -> None:
