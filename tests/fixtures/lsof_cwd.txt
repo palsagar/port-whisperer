@@ -1,0 +1,6 @@
+COMMAND     PID USER   FD   TYPE DEVICE SIZE/OFF     NODE NAME
+python3.1 23928  dev  cwd    DIR   1,17     1312 47598802 {root}/simulator
+bun       27660  dev  cwd    DIR   1,17     1312 47598803 {root}/claude-mem
+node      41000  dev  cwd    DIR   1,17     1312 47598804 {root}/webapp/src
+node      41100  dev  cwd    DIR   1,17     1312 47598805 {root}/nextcloud-sync
+codex     41200  dev  cwd    DIR   1,17     1312 47598806 {root}/agent
