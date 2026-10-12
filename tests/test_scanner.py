@@ -277,6 +277,10 @@ def test_all_processes_skip_own_pid(fake_run, frozen_now, monkeypatch):
         ("node /srv/escargot/index.js", "node", "Node.js"),
         ("python /srv/guardrails/app.py", "python", "Python"),
         ("node nextcloud-sync", "node", "Node.js"),
+        # The package folder under node_modules is a framework signal too
+        ("node /app/node_modules/@angular/cli/bin/ng.js serve", "node", "Angular"),
+        ("node /app/node_modules/@remix-run/dev/dist/cli.js dev", "node", "Remix"),
+        ("node /a/node_modules/gatsby/dist/commands/develop.js", "node", "Gatsby"),
     ],
 )
 def test_detect_framework_from_command(command, name, expected):

@@ -326,11 +326,15 @@ def _detect_framework_from_command(command: str, process_name: str) -> str | Non
 
     # Keep only the basename of each non-flag argument, so directory names in
     # paths (e.g. /srv/nextcloud-sync/server.js) cannot trigger a match
-    cmd = " ".join(
-        os.path.basename(part)
-        for part in command.lower().split()
-        if not part.startswith("-")
-    )
+    tokens: list[str] = []
+    for part in command.lower().split():
+        if part.startswith("-"):
+            continue
+        tokens.append(os.path.basename(part))
+        # The package folder under node_modules names the tool being run,
+        # e.g. node_modules/@angular/cli/bin/ng.js
+        tokens.extend(re.findall(r"node_modules/((?:@[^/]+/)?[^/]+)", part))
+    cmd = " ".join(tokens)
 
     # Whole words only — "invite" must not match Vite, "guardrails" not Rails
     patterns = [
