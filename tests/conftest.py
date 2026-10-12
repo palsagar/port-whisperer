@@ -11,10 +11,10 @@ from portwhisperer import scanner
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
-# Most specific match first: "lsof -a -d cwd" and "lsof -t" must not hit the
+# Most specific match first: "lsof -a -d cwd" and "lsof -w -t" must not hit the
 # LISTEN route.
 ROUTES: list[tuple[str, str]] = [
-    ("lsof -t", "lsof_pids.txt"),
+    ("lsof -w -t", "lsof_pids.txt"),
     ("-sTCP:LISTEN", "lsof_listen.txt"),
     ("-d cwd", "lsof_cwd.txt"),
     ("ps -p", "ps_batch.txt"),

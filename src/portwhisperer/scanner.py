@@ -164,6 +164,9 @@ def _batch_cwd(pids: list[int]) -> dict[int, str]:
 def _batch_docker_info() -> dict[int, dict]:
     """Single docker ps call to get container info keyed by host port.
 
+    Only TCP bindings count. A port that two containers publish is left out,
+    because a kill could not tell which container to stop.
+
     Returns
     -------
     dict[int, dict]
@@ -177,6 +180,7 @@ def _batch_docker_info() -> dict[int, dict]:
         print(docker.get(5432))
     """
     result: dict[int, dict] = {}
+    ambiguous: set[int] = set()
     try:
         proc = subprocess.run(
             ["docker", "ps", "--format", "{{.Ports}}\\t{{.Names}}\\t{{.Image}}"],
@@ -194,18 +198,21 @@ def _batch_docker_info() -> dict[int, dict]:
             image = parts[2] if len(parts) > 2 else ""
 
             # Parse port mappings like "0.0.0.0:5432->5432/tcp, [::]:5432->5432/tcp"
-            seen: set[int] = set()
-            for m in re.finditer(r"(?:\d+\.\d+\.\d+\.\d+|::):(\d+)->", ports_str):
+            # and skip UDP ones, which never show up as TCP listeners
+            pattern = r"(?:\d+\.\d+\.\d+\.\d+|::):(\d+)->\d+/tcp"
+            for m in re.finditer(pattern, ports_str):
                 port = int(m.group(1))
-                if port not in seen:
-                    seen.add(port)
-                    result[port] = {"name": name, "image": image}
+                if port in result and result[port]["name"] != name:
+                    ambiguous.add(port)
+                result[port] = {"name": name, "image": image}
     except (
         subprocess.TimeoutExpired,
         subprocess.CalledProcessError,
         FileNotFoundError,
     ):
         pass
+    for port in ambiguous:
+        del result[port]
     return result
 
 
@@ -1277,12 +1284,18 @@ def _port_listener_pids(port: int) -> set[int] | None:
     """
     try:
         proc = subprocess.run(
-            ["lsof", "-t", f"-iTCP:{port}", "-sTCP:LISTEN", "-P", "-n"],
+            # -w hides harmless warnings, so anything on stderr is a real error
+            ["lsof", "-w", "-t", f"-iTCP:{port}", "-sTCP:LISTEN", "-P", "-n"],
             capture_output=True,
             text=True,
             timeout=5,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    # lsof exits 1 both for "no match" and for errors; only errors print
+    if proc.returncode == 1 and not proc.stdout.strip() and not proc.stderr.strip():
+        return set()
+    if proc.returncode != 0:
         return None
     return {int(pid) for pid in proc.stdout.split() if pid.isdigit()}
 
@@ -1389,6 +1402,23 @@ def _stop_container(info: PortInfo, force: bool) -> KillResult:
     """
     action = "kill" if force else "stop"
     name = info.container or ""
+
+    # Re-check right before stopping: the port may be free already, or a
+    # different container may have taken it since the user confirmed
+    before = _port_listener_pids(info.port)
+    if before is None or info.pid not in before:
+        return _port_free_result(info, before)
+    current = _batch_docker_info().get(info.port)
+    if current is None or current["name"] != name:
+        now = f"now {current['name']}" if current else "now unknown"
+        return KillResult(
+            info.port,
+            info.pid,
+            False,
+            f"the container on :{info.port} changed since it was listed "
+            f"(was {name}, {now}). Nothing was stopped; run the command again",
+        )
+
     try:
         # docker stop waits up to 10 s for the container before it kills it
         proc = subprocess.run(

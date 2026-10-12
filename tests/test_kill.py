@@ -60,7 +60,7 @@ def _node(**overrides: object) -> PortInfo:
 
 def test_listener_pids_parses_lsof(fake_run):
     assert scanner._port_listener_pids(3000) == {41000}
-    (call,) = fake_run.commands("lsof -t")
+    (call,) = fake_run.commands("lsof -w -t")
     assert "-iTCP:3000" in call
     assert "-sTCP:LISTEN" in call
 
@@ -153,8 +153,29 @@ def test_zombie_gets_no_signal(monkeypatch, signals):
     assert "40990" in result.detail
 
 
+def _backend(**overrides: object) -> PortInfo:
+    fields: dict = dict(
+        port=5432, pid=1500, raw_name="com.docker.backend", container="dev-postgres"
+    )
+    fields.update(overrides)
+    return _node(**fields)
+
+
+def _docker_run(fake_run, returncode: int, stderr: str):
+    """Fail docker stop/kill but serve every other command from the fixtures."""
+
+    def run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+        if args[:2] in (["docker", "stop"], ["docker", "kill"]):
+            fake_run.calls.append(args)
+            return subprocess.CompletedProcess(args, returncode, "", stderr)
+        return fake_run(args, **kwargs)
+
+    return run
+
+
 def test_docker_port_stops_container(monkeypatch, fake_run, signals):
-    _listeners(monkeypatch, lambda: set() if fake_run.commands("docker") else {1500})
+    stopped = lambda: fake_run.commands("docker stop")  # noqa: E731
+    _listeners(monkeypatch, lambda: set() if stopped() else {1500})
     info = _node(
         port=5432,
         pid=1500,
@@ -163,28 +184,27 @@ def test_docker_port_stops_container(monkeypatch, fake_run, signals):
         container="dev-postgres",
     )
     result = scanner.free_port(info)
-    assert fake_run.commands("docker") == ["docker stop dev-postgres"]
+    assert fake_run.commands("docker stop") == ["docker stop dev-postgres"]
     # The Docker backend must never receive a signal
     assert signals == []
     assert result.ok
 
 
 def test_docker_force_kills_container(monkeypatch, fake_run, signals):
-    _listeners(monkeypatch, lambda: set())
-    info = _node(port=5432, pid=1500, raw_name="com.docker.backend", container="pg")
-    scanner.free_port(info, force=True)
-    assert fake_run.commands("docker") == ["docker kill pg"]
+    killed = lambda: fake_run.commands("docker kill")  # noqa: E731
+    _listeners(monkeypatch, lambda: set() if killed() else {1500})
+    assert scanner.free_port(_backend(), force=True).ok
+    assert fake_run.commands("docker kill") == ["docker kill dev-postgres"]
+    assert fake_run.commands("docker stop") == []
     assert signals == []
 
 
 def test_docker_stop_failure(monkeypatch, fake_run, signals):
-    def failing(args: list[str], **kwargs: object) -> subprocess.CompletedProcess:
-        return subprocess.CompletedProcess(args, 1, "", "Error: no such container")
-
-    monkeypatch.setattr(subprocess, "run", failing)
+    monkeypatch.setattr(
+        subprocess, "run", _docker_run(fake_run, 1, "Error: no such container")
+    )
     _listeners(monkeypatch, lambda: {1500})
-    info = _node(port=5432, pid=1500, raw_name="com.docker.backend", container="pg")
-    result = scanner.free_port(info)
+    result = scanner.free_port(_backend())
     assert not result.ok
     assert "no such container" in result.detail
 
@@ -242,13 +262,69 @@ def test_other_listener_from_before_is_not_called_a_restart(monkeypatch, signals
     assert "50000" in result.detail
 
 
-def test_docker_stderr_control_characters_are_removed(monkeypatch, signals):
-    def failing(args: list[str], **kwargs: object) -> subprocess.CompletedProcess:
-        return subprocess.CompletedProcess(args, 1, "", "bad\x1b[2Jthing\x07")
-
-    monkeypatch.setattr(subprocess, "run", failing)
+def test_docker_stderr_control_characters_are_removed(monkeypatch, fake_run, signals):
+    monkeypatch.setattr(subprocess, "run", _docker_run(fake_run, 1, "bad\x1b[2J\x07"))
     _listeners(monkeypatch, lambda: {1500})
-    info = _node(port=5432, pid=1500, raw_name="com.docker.backend", container="pg")
-    detail = scanner.free_port(info).detail
+    detail = scanner.free_port(_backend()).detail
+    assert "bad[2J" in detail
     assert "\x1b" not in detail
     assert "\x07" not in detail
+
+
+# ── challenge-review fixes ────────────────────────────────────────────────────
+
+
+def test_docker_map_ignores_udp(fake_run):
+    fake_run.outputs["docker_ps.txt"] = (
+        "0.0.0.0:5432->5432/tcp\tdev-postgres\tpostgres:15\n"
+        "0.0.0.0:5432->5432/udp\tmetrics\tstatsd\n"
+    )
+    assert scanner._batch_docker_info()[5432]["name"] == "dev-postgres"
+
+
+def test_docker_map_drops_ambiguous_ports(fake_run):
+    # Two containers publish TCP :5432 on different addresses; neither is safe
+    fake_run.outputs["docker_ps.txt"] = (
+        "127.0.0.1:5432->5432/tcp\tpg-a\tpostgres:15\n"
+        "127.0.0.2:5432->5432/tcp\tpg-b\tpostgres:15\n"
+    )
+    assert 5432 not in scanner._batch_docker_info()
+
+
+def test_docker_same_container_on_both_families_is_not_ambiguous(fake_run):
+    assert scanner._batch_docker_info()[5432]["name"] == "dev-postgres"
+
+
+def test_docker_changed_container_is_refused(monkeypatch, fake_run, signals):
+    # Between the prompt and the kill, another container took the port
+    fake_run.outputs["docker_ps.txt"] = "0.0.0.0:5432->5432/tcp\tother\tredis:7\n"
+    _listeners(monkeypatch, lambda: {1500})
+    result = scanner.free_port(_backend())
+    assert fake_run.commands("docker stop") == []
+    assert not result.ok
+    assert "other" in result.detail
+
+
+def test_docker_port_already_free_is_not_stopped(monkeypatch, fake_run, signals):
+    _listeners(monkeypatch, lambda: set())
+    assert scanner.free_port(_backend()).ok
+    assert fake_run.commands("docker stop") == []
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "stderr", "expected"),
+    [
+        (0, "41000\n", "", {41000}),
+        # lsof exits 1 with no output when nothing matches
+        (1, "", "", set()),
+        # ...and also exits 1 on a real error, but then it explains on stderr
+        (1, "", "lsof: unknown service", None),
+        (2, "", "", None),
+    ],
+)
+def test_listener_pids_exit_codes(monkeypatch, returncode, stdout, stderr, expected):
+    def run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(args, returncode, stdout, stderr)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert scanner._port_listener_pids(3000) == expected
