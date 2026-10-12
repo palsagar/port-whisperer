@@ -397,67 +397,38 @@ def display_port_detail(info: PortInfo | None) -> None:
     console.print()
 
 
-def display_clean_results(
-    orphaned: list[PortInfo],
-    killed: list[int],
-    failed: list[int],
-) -> None:
-    """Render the results of a ``ports clean`` run.
+def display_clean_candidates(candidates: list[PortInfo]) -> None:
+    """Render the numbered list that ``ports clean`` asks the user to pick from.
 
     Parameters
     ----------
-    orphaned : list[PortInfo]
-        All orphaned/zombie ports that were targeted.
-    killed : list[int]
-        PIDs successfully killed.
-    failed : list[int]
-        PIDs that could not be killed.
+    candidates : list[PortInfo]
+        Detached and zombie dev servers, from
+        :func:`~portwhisperer.scanner.find_clean_candidates`.
 
     Examples
     --------
     .. code-block:: python
 
-        display_clean_results(orphaned, killed=[], failed=[])
+        display_clean_candidates(find_clean_candidates())
     """
     render_header()
 
-    if not orphaned:
+    if not candidates:
         console.print(
-            "[green]  ✓ No orphaned or zombie processes found. All clean![/]\n"
+            "[green]  ✓ Nothing to clean: no detached or zombie dev servers.[/]"
         )
+        console.print("[dim]  Daemons (--daemon, launchd jobs) are left alone.[/]\n")
         return
 
-    count = len(orphaned)
-    noun = "process" if count == 1 else "processes"
-    console.print(f"[bold yellow]  Found {count} orphaned/zombie {noun}:[/]\n")
-
-    for p in orphaned:
-        was_killed = p.pid in killed
-        did_fail = p.pid in failed
-
-        # Show outcome icon: checkmark killed, cross failed, question unknown
-        if was_killed:
-            icon = "[green]✓[/]"
-        elif did_fail:
-            icon = "[red]✕[/]"
-        else:
-            icon = "[yellow]?[/]"
-
+    count = len(candidates)
+    noun = "server" if count == 1 else "servers"
+    console.print(f"[bold]  {count} detached or zombie dev {noun}:[/]\n")
+    for i, p in enumerate(candidates, 1):
         console.print(
-            f"  {icon} :[bold white]{p.port}[/] [dim]—[/] "
-            f"{p.process_name} [dim](PID {p.pid})[/]"
+            f"  [dim]{i}.[/] :[bold white]{p.port}[/] [dim]—[/] "
+            f"{_target_label(p)}  {format_status(p.status)}"
         )
-        if did_fail:
-            console.print(f"[red]    Failed to kill. Try: sudo kill -9 {p.pid}[/]")
-
-    console.print()
-    if killed:
-        k = len(killed)
-        console.print(f"[green]  Cleaned {k} process{'es' if k != 1 else ''}.[/]")
-    if failed:
-        f_count = len(failed)
-        noun = "processes" if f_count != 1 else "process"
-        console.print(f"[red]  Failed to clean {f_count} {noun}.[/]")
     console.print()
 
 

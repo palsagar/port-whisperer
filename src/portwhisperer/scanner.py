@@ -1135,23 +1135,79 @@ def get_port_details(port: int) -> PortInfo | None:
     return None
 
 
-def find_orphaned_processes() -> list[PortInfo]:
-    """Return listening ports whose process status is detached or zombie.
+def _launchd_pids() -> set[int]:
+    """Return the PIDs of running jobs that launchd manages for this user.
+
+    ``brew services`` and other launch agents show up here.
 
     Returns
     -------
-    list[PortInfo]
-        Ports with status "detached" or "zombie".
+    set[int]
+        PIDs from the first column of ``launchctl list``; empty on failure.
 
     Examples
     --------
     .. code-block:: python
 
-        for p in find_orphaned_processes():
+        if 1234 in _launchd_pids():
+            print("managed by launchd")
+    """
+    try:
+        proc = subprocess.run(
+            ["launchctl", "list"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return set()
+    pids: set[int] = set()
+    for line in proc.stdout.splitlines()[1:]:  # skip header
+        parts = line.split()
+        # Jobs that are loaded but not running show "-" instead of a PID
+        if parts and parts[0].isdigit():
+            pids.add(int(parts[0]))
+    return pids
+
+
+def find_clean_candidates() -> list[PortInfo]:
+    """Return the dev servers that ``ports clean`` may offer to kill.
+
+    These are zombies, plus detached processes that are not intentional
+    daemons. A detached process counts as a daemon, and is left out, when:
+
+    - its command line contains ``--daemon``, or
+    - launchd manages it (its PID is in ``launchctl list``), as with
+      ``brew services``.
+
+    pm2 needs no rule: its processes are children of the pm2 daemon, not of
+    PID 1, so they are never detached.
+
+    Returns
+    -------
+    list[PortInfo]
+        Candidate ports, sorted by port number.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        for p in find_clean_candidates():
             print(p.port, p.status)
     """
     ports = get_listening_ports()
-    return [p for p in ports if p.status in ("detached", "zombie")]
+    # Only pay for the launchctl call when there is a detached process to check
+    launchd = _launchd_pids() if any(p.status == "detached" for p in ports) else set()
+    return [
+        p
+        for p in ports
+        if p.status == "zombie"
+        or (
+            p.status == "detached"
+            and "--daemon" not in p.command
+            and p.pid not in launchd
+        )
+    ]
 
 
 @dataclass
@@ -1288,7 +1344,7 @@ def _port_free_result(info: PortInfo) -> KillResult:
     if listeners is None:
         return fail(f"could not check whether :{info.port} is free (lsof failed)")
     if not listeners:
-        return KillResult(info.port, info.pid, True, f":{info.port} is free")
+        return KillResult(info.port, info.pid, True, "port is free")
     if info.pid in listeners:
         return fail(f"PID {info.pid} still listens on :{info.port}")
     # The old process is gone but something restarted the server

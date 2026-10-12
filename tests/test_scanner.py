@@ -411,3 +411,32 @@ def test_missing_binaries(monkeypatch):
     assert scanner._get_git_branch("/tmp") is None
     assert scanner.get_listening_ports() == []
     assert scanner.get_all_processes() == []
+
+
+# ── find_clean_candidates ─────────────────────────────────────────────────────
+
+
+def _drop_daemon_flag(fake_run) -> None:
+    """Make the bun worker an ordinary detached process."""
+    ps = fake_run.outputs["ps_batch.txt"]
+    fake_run.outputs["ps_batch.txt"] = ps.replace(" --daemon", "")
+
+
+def test_clean_skips_daemon_flag(fake_run, frozen_now):
+    # The bun worker is detached but runs with --daemon; the zombie stays
+    assert [p.port for p in scanner.find_clean_candidates()] == [3001]
+
+
+def test_clean_offers_detached_non_daemon(fake_run, frozen_now):
+    _drop_daemon_flag(fake_run)
+    assert [p.port for p in scanner.find_clean_candidates()] == [3001, 37777]
+
+
+def test_clean_skips_launchd_jobs(fake_run, frozen_now):
+    _drop_daemon_flag(fake_run)
+    fake_run.outputs["launchctl_list.txt"] += "27660\t0\thomebrew.mxcl.worker\n"
+    assert [p.port for p in scanner.find_clean_candidates()] == [3001]
+
+
+def test_launchd_pids(fake_run):
+    assert scanner._launchd_pids() == {98426, 679}

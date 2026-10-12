@@ -23,6 +23,7 @@ ROUTES: list[tuple[str, str]] = [
     ("docker ps", "docker_ps.txt"),
     ("docker stop", "docker_stop.txt"),
     ("docker kill", "docker_stop.txt"),
+    ("launchctl list", "launchctl_list.txt"),
 ]
 
 # The frozen "now" used for uptime assertions.

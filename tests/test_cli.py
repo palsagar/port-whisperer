@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import click
 import pytest
 from click.testing import CliRunner
 
@@ -170,3 +171,86 @@ def test_detail_hint_points_to_ports_kill(monkeypatch, detail):
     result = CliRunner().invoke(cli.main, ["3000"])
     assert "ports kill 3000" in result.output
     assert "ports clean" not in result.output
+
+
+# ── ports clean ───────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def clean(monkeypatch: pytest.MonkeyPatch, killer) -> list[tuple[int, bool]]:
+    """Offer two detached candidates; reuse the kill recorder."""
+    monkeypatch.setattr(
+        cli,
+        "find_clean_candidates",
+        lambda: [
+            _info(3000, 41000, status="detached"),
+            _info(4000, 41100, status="detached"),
+        ],
+    )
+    return killer
+
+
+def test_clean_kills_only_the_picked_process(clean):
+    result = CliRunner().invoke(cli.main, ["clean"], input="2\n")
+    assert result.exit_code == 0, result.output
+    assert clean == [(4000, False)]
+    assert "Kill which?" in result.output
+    # Each process appears once in the list; the picked one once more in results
+    assert result.output.count("PID 41000") == 1
+    assert result.output.count("PID 41100") == 2
+
+
+def test_clean_defaults_to_none(clean):
+    result = CliRunner().invoke(cli.main, ["clean"], input="\n")
+    assert result.exit_code == 0, result.output
+    assert clean == []
+
+
+def test_clean_all(clean):
+    result = CliRunner().invoke(cli.main, ["clean"], input="all\n")
+    assert result.exit_code == 0, result.output
+    assert clean == [(3000, False), (4000, False)]
+
+
+def test_clean_reasks_on_bad_input(clean):
+    result = CliRunner().invoke(cli.main, ["clean"], input="7\n1\n")
+    assert result.exit_code == 0, result.output
+    assert "7" in result.output
+    assert clean == [(3000, False)]
+
+
+def test_clean_without_tty_kills_nothing(monkeypatch, clean):
+    monkeypatch.setattr(cli, "_stdin_is_tty", lambda: False)
+    result = CliRunner().invoke(cli.main, ["clean"])
+    assert result.exit_code == 0, result.output
+    assert "Kill which?" not in result.output
+    assert clean == []
+
+
+def test_clean_with_no_candidates(monkeypatch, killer):
+    monkeypatch.setattr(cli, "find_clean_candidates", lambda: [])
+    result = CliRunner().invoke(cli.main, ["clean"])
+    assert result.exit_code == 0, result.output
+    assert "Nothing to clean" in result.output
+    assert killer == []
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("", []),
+        ("none", []),
+        ("all", [0, 1, 2]),
+        ("1,3", [0, 2]),
+        ("3 1 3", [2, 0]),
+        (" 2 ", [1]),
+    ],
+)
+def test_parse_selection(raw, expected):
+    assert cli._parse_selection(raw, 3) == expected
+
+
+@pytest.mark.parametrize("raw", ["0", "4", "x", "1,,y", "-1"])
+def test_parse_selection_rejects(raw):
+    with pytest.raises(click.BadParameter):
+        cli._parse_selection(raw, 3)

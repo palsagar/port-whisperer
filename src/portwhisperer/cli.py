@@ -7,7 +7,7 @@ import click
 from rich.console import Console
 
 from portwhisperer.display import (
-    display_clean_results,
+    display_clean_candidates,
     display_kill_results,
     display_kill_targets,
     display_port_detail,
@@ -19,7 +19,7 @@ from portwhisperer.display import (
 from portwhisperer.scanner import (
     KillResult,
     ProcessInfo,
-    find_orphaned_processes,
+    find_clean_candidates,
     free_port,
     get_all_processes,
     get_listening_ports,
@@ -229,39 +229,78 @@ def ps(show_all: bool) -> None:
     display_process_table(processes, filtered=not show_all)
 
 
+def _parse_selection(raw: str, count: int) -> list[int]:
+    """Turn the answer to "Kill which?" into zero-based candidate indexes.
+
+    Parameters
+    ----------
+    raw : str
+        The answer: ``all``, ``none`` or empty, or numbers separated by commas
+        or spaces.
+    count : int
+        Number of candidates on offer.
+
+    Returns
+    -------
+    list[int]
+        Picked indexes in the order given, without duplicates.
+
+    Raises
+    ------
+    click.BadParameter
+        When a number is out of range or the answer cannot be read. Click then
+        asks again.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        _parse_selection("1,3", 3)  # [0, 2]
+        _parse_selection("all", 2)  # [0, 1]
+    """
+    answer = raw.strip().lower()
+    if answer in ("", "none"):
+        return []
+    if answer == "all":
+        return list(range(count))
+    picked: list[int] = []
+    for token in answer.replace(",", " ").split():
+        if not token.isdigit() or not 1 <= int(token) <= count:
+            raise click.BadParameter(
+                f"{token!r} is not a number from 1 to {count}, 'all' or 'none'"
+            )
+        if int(token) - 1 not in picked:
+            picked.append(int(token) - 1)
+    if not picked:
+        raise click.BadParameter("give numbers like 1,3, or 'all' or 'none'")
+    return picked
+
+
 @main.command()
 def clean() -> None:
-    """Kill orphaned and zombie dev server processes."""
-    orphaned = find_orphaned_processes()
-
-    if not orphaned:
-        display_clean_results(orphaned, killed=[], failed=[])
+    """Pick detached or zombie dev servers to kill. Daemons are left alone."""
+    candidates = find_clean_candidates()
+    display_clean_candidates(candidates)
+    if not candidates:
         return
 
-    # List what will be killed before asking for confirmation
-    console.print()
-    count = len(orphaned)
-    noun = "process" if count == 1 else "processes"
-    console.print(f"[bold yellow]  Found {count} orphaned/zombie {noun}:[/]\n")
-    for p in orphaned:
+    if not _stdin_is_tty():
         console.print(
-            f"  [dim]•[/] :[bold white]{p.port}[/] [dim]—[/] "
-            f"{p.process_name} [dim](PID {p.pid})[/]"
+            "[dim]  No terminal, so nothing was killed. "
+            "Use [/][cyan]ports kill <port> --yes[/][dim].[/]\n"
         )
-    console.print()
+        return
 
-    killed: list[int] = []
-    failed: list[int] = []
-
-    if click.confirm("  Kill all?", default=False):
-        for p in orphaned:
-            if free_port(p).ok:
-                killed.append(p.pid)
-            else:
-                failed.append(p.pid)
-        display_clean_results(orphaned, killed=killed, failed=failed)
-    else:
-        console.print("[dim]\n  Aborted.\n[/]")
+    picked = click.prompt(
+        "  Kill which? (e.g. 1,3 / all / none)",
+        default="none",
+        show_default=False,
+        value_proc=lambda raw: _parse_selection(raw, len(candidates)),
+    )
+    if not picked:
+        console.print("[dim]\n  Nothing killed.\n[/]")
+        return
+    display_kill_results([free_port(candidates[i]) for i in picked])
 
 
 @main.command()
