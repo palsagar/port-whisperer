@@ -1155,10 +1155,13 @@ def get_listening_ports() -> list[PortInfo]:
     except subprocess.TimeoutExpired as exc:
         raise ScanError("lsof did not answer within 10 seconds") from exc
     raw = proc.stdout
-    # lsof exits 1 both for "no match" and for errors; only errors print
-    if proc.returncode != 0 and not raw.strip() and proc.stderr.strip():
+    # Exit 0 is a full scan, and exit 1 with no output at all means "no
+    # listener". Anything else (an error, a signal, partial output) may hide
+    # busy ports, so it must not pass for a scan.
+    no_match = proc.returncode == 1 and not raw.strip() and not proc.stderr.strip()
+    if proc.returncode != 0 and not no_match:
         error = re.sub(r"[\x00-\x1f\x7f]", " ", proc.stderr.strip())
-        raise ScanError(f"lsof failed: {error}")
+        raise ScanError(f"lsof failed: {error or f'exit code {proc.returncode}'}")
 
     lines = raw.strip().splitlines()
     if not lines:
@@ -1593,10 +1596,13 @@ def container_engine(name: str, command: str = "") -> str | None:
         return "Lima"
     if name == "gvproxy":
         return "Podman"
-    # Lima (and so Colima and Rancher Desktop) forwards over ssh with the
-    # instance's own ssh.config, e.g. ~/.lima/default/ssh.config or
-    # ~/Library/Application Support/rancher-desktop/lima/0/ssh.config
-    if name == "ssh" and re.search(r"lima\S*/ssh\.config|/\.colima/", command, re.I):
+    # Lima (and so Colima and Rancher Desktop) forwards over ssh using files in
+    # the instance directory: ControlPath=~/.lima/default/ssh.sock, an ssh
+    # master shown as "ssh: .../ssh.sock [mux]", or an older -F ssh.config.
+    # Rancher's directory is ~/Library/Application Support/rancher-desktop/lima.
+    if name == "ssh" and re.search(
+        r"lima\S*/ssh\.(sock|config)|/\.colima/", command, re.I
+    ):
         return "Lima"
     return None
 

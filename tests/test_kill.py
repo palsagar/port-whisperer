@@ -437,6 +437,21 @@ COLIMA_SSH = "ssh -F /Users/dev/.colima/_lima/colima/ssh.config -L 5432:x lima-c
         ("limactl", "limactl hostagent colima", "Lima"),
         ("ssh", COLIMA_SSH, "Lima"),
         ("ssh", "ssh -F /Users/dev/.lima/default/ssh.config lima-default", "Lima"),
+        # What Lima runs today: -F /dev/null and a control socket
+        (
+            "ssh",
+            "ssh -F /dev/null -o ControlMaster=auto "
+            "-o ControlPath=/Users/dev/.lima/default/ssh.sock -L 5432:x 127.0.0.1",
+            "Lima",
+        ),
+        # The ssh master renames itself after the control socket
+        ("ssh", "ssh: /Users/dev/.lima/default/ssh.sock [mux]", "Lima"),
+        (
+            "ssh",
+            "ssh: /Users/dev/Library/Application Support/rancher-desktop/lima/0"
+            "/ssh.sock [mux]",
+            "Lima",
+        ),
         (
             "ssh",
             "ssh -F /Users/dev/Library/Application Support/rancher-desktop/lima/0"

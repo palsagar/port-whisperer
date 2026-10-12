@@ -422,6 +422,10 @@ def test_missing_binaries(monkeypatch):
         (1, "", "", False),  # no listener at all
         (1, "", "lsof: unknown option", True),
         (0, "COMMAND PID\n", "", False),
+        # Killed by a signal, with nothing on either stream
+        (-9, "", "", True),
+        # Partial output with an error: the missing rows may be busy ports
+        (1, "COMMAND PID\n", "", True),
     ],
 )
 def test_listening_ports_scan_errors(monkeypatch, returncode, stdout, stderr, fails):
@@ -430,7 +434,7 @@ def test_listening_ports_scan_errors(monkeypatch, returncode, stdout, stderr, fa
 
     monkeypatch.setattr(subprocess, "run", run)
     if fails:
-        with pytest.raises(scanner.ScanError, match="unknown option"):
+        with pytest.raises(scanner.ScanError, match="lsof failed"):
             scanner.get_listening_ports()
     else:
         assert scanner.get_listening_ports() == []
