@@ -620,6 +620,31 @@ def _get_process_tree(pid: int) -> list[dict]:
     return tree
 
 
+def _decode_lsof_name(name: str) -> str:
+    """Decode the ``\\xNN`` escapes that lsof writes into the COMMAND column.
+
+    lsof escapes spaces and other unsafe bytes so each line splits cleanly on
+    whitespace, e.g. ``Google\\x20Chrome``.
+
+    Parameters
+    ----------
+    name : str
+        Raw COMMAND value from lsof.
+
+    Returns
+    -------
+    str
+        The name with every ``\\xNN`` sequence replaced by its character.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        print(_decode_lsof_name("Google\\\\x20Chrome"))  # "Google Chrome"
+    """
+    return re.sub(r"\\x([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), name)
+
+
 # ── public API ────────────────────────────────────────────────────────────────
 
 
@@ -789,7 +814,8 @@ def get_listening_ports(detailed: bool = False) -> list[PortInfo]:
     """
     try:
         proc = subprocess.run(
-            "lsof -iTCP -sTCP:LISTEN -P -n",
+            # +c 0 stops lsof from cutting process names to 9 characters
+            "lsof +c 0 -iTCP -sTCP:LISTEN -P -n",
             shell=True,
             capture_output=True,
             text=True,
@@ -811,7 +837,7 @@ def get_listening_ports(detailed: bool = False) -> list[PortInfo]:
         if len(parts) < 9:
             continue
 
-        process_name = parts[0]
+        process_name = _decode_lsof_name(parts[0])
         pid = int(parts[1])
         name_field = parts[8]
 

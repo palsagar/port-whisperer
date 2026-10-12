@@ -1,6 +1,7 @@
   679     1 S     16240 Tue Mar 24 21:28:04 2026     /usr/libexec/rapportd
   745     1 S     71264 Tue Mar 24 21:28:05 2026     /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
  1500  1450 S   2097152 Sun Oct 11 08:00:00 2026     /Applications/Docker.app/Contents/MacOS/com.docker.backend
+ 5555     1 S    409600 Mon Oct 12 08:00:00 2026     /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=9222
  9708     1 S    204800 Tue Mar 24 21:30:00 2026     /Applications/Raycast.app/Contents/MacOS/Raycast
 23928 23892 S+    11200 Mon Oct 12 11:37:33 2026     /Users/dev/projects/simulator/.venv/bin/python3 /Users/dev/projects/simulator/.venv/bin/uvicorn simulator.server:app --port 8012
 27660     1 Ss    50576 Mon Oct 12 00:02:08 2026     /Users/dev/.bun/bin/bun /Users/dev/.claude-mem/scripts/worker-service.cjs --daemon

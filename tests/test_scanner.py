@@ -33,6 +33,7 @@ def test_one_entry_per_port_sorted(fake_run, frozen_now):
         7265,
         8000,
         8012,
+        9222,
         37777,
         54361,
         62813,
@@ -42,10 +43,18 @@ def test_one_entry_per_port_sorted(fake_run, frozen_now):
 def test_port_pid_and_process_name(ports):
     assert ports[8012].pid == 23928
     assert ports[5000].pid == ports[7000].pid == 745
-    # bug: see #2 — lsof cuts the COMMAND column to 9 characters
-    assert ports[8012].process_name == "python3.1"
-    assert ports[5000].process_name == "ControlCe"
-    assert ports[54361].process_name == "magnitude"
+    # lsof +c 0 prints the full COMMAND name instead of 9 characters
+    assert ports[8012].process_name == "python3.13"
+    assert ports[5000].process_name == "ControlCenter"
+    assert ports[54361].process_name == "magnitude-acn"
+    # lsof escapes the space as \x20; the scanner decodes it
+    assert ports[9222].process_name == "Google Chrome"
+
+
+def test_lsof_asks_for_full_names(fake_run):
+    scanner.get_listening_ports()
+    (listen_call,) = fake_run.commands("-sTCP:LISTEN")
+    assert "+c 0" in str(listen_call)
 
 
 def test_command_comes_from_ps(ports):
@@ -86,7 +95,7 @@ def test_start_time_and_uptime(ports):
 def test_docker_override(ports):
     pg = ports[5432]
     assert pg.process_name == "docker"
-    assert pg.raw_name == "com.docke"
+    assert pg.raw_name == "com.docker.backend"
     assert pg.project_name == "dev-postgres"
     assert pg.framework == "PostgreSQL"
     assert pg.cwd is None
@@ -95,7 +104,7 @@ def test_docker_override(ports):
 def test_docker_not_queried_without_docker_process(fake_run, frozen_now):
     listing = fake_run.outputs["lsof_listen.txt"].splitlines()
     fake_run.outputs["lsof_listen.txt"] = "\n".join(
-        line for line in listing if not line.startswith("com.docke")
+        line for line in listing if not line.startswith("com.docker")
     )
     scanner.get_listening_ports()
     assert fake_run.commands("docker") == []
@@ -117,7 +126,7 @@ def test_framework(ports):
     assert ports[37777].framework is None
     # bug: see #2 — "next" inside the path "nextcloud-sync" wins over package.json
     assert ports[4000].framework == "Next.js"
-    # bug: see #2 — "python3.1" (python3.12) is not recognised as Python
+    # bug: see #2 — python3.12 is not recognised as Python
     assert ports[8000].framework is None
 
 
@@ -310,7 +319,7 @@ def test_detect_framework_from_image(image, expected):
         ("zsh", "", False),
         # Blocklist wins over a matching command line
         ("Slack", "node /Applications/Slack.app/app.js", False),
-        ("ControlCe", "", False),
+        ("ControlCenter", "", False),
         ("code", "node extension-host.js", False),
         # A versioned binary still passes when its command has a dev pattern
         ("python3.13", "python3.13 -m uvicorn app:app", True),
