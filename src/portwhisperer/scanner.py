@@ -637,7 +637,8 @@ def _decode_lsof_name(name: str) -> str:
     Returns
     -------
     str
-        The name with every ``\\xNN`` sequence replaced by its character.
+        The name with printable ASCII escapes decoded. Control characters and
+        non-ASCII bytes stay escaped.
 
     Examples
     --------
@@ -645,7 +646,13 @@ def _decode_lsof_name(name: str) -> str:
 
         print(_decode_lsof_name("Google\\\\x20Chrome"))  # "Google Chrome"
     """
-    return re.sub(r"\\x([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), name)
+
+    def _unescape(m: re.Match[str]) -> str:
+        char = chr(int(m.group(1), 16))
+        # A process picks its own name, so never let it emit terminal control codes
+        return char if char.isascii() and char.isprintable() else m.group(0)
+
+    return re.sub(r"\\x([0-9a-fA-F]{2})", _unescape, name)
 
 
 # ── public API ────────────────────────────────────────────────────────────────

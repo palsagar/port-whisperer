@@ -51,6 +51,21 @@ def test_port_pid_and_process_name(ports):
     assert ports[9222].process_name == "Google Chrome"
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("Google\\x20Chrome", "Google Chrome"),
+        ("node", "node"),
+        # Control characters stay escaped so they never reach the terminal
+        ("evil\\x1b[2Jname", "evil\\x1b[2Jname"),
+        ("bell\\x07", "bell\\x07"),
+        ("del\\x7f", "del\\x7f"),
+    ],
+)
+def test_decode_lsof_name(raw, expected):
+    assert scanner._decode_lsof_name(raw) == expected
+
+
 def test_lsof_asks_for_full_names(fake_run):
     scanner.get_listening_ports()
     (listen_call,) = fake_run.commands("-sTCP:LISTEN")
