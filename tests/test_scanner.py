@@ -251,6 +251,7 @@ def test_all_processes_skip_own_pid(fake_run, frozen_now, monkeypatch):
         ("node /app/node_modules/vite/bin/vite.js", "node", "Vite"),
         ("nuxt dev", "node", "Nuxt"),
         ("ng serve --port 4200", "node", "Angular"),
+        ("node /app/node_modules/.bin/ng serve --port 4200", "node", "Angular"),
         ("webpack serve", "node", "Webpack"),
         ("remix dev", "node", "Remix"),
         ("astro dev", "node", "Astro"),
