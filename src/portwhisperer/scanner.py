@@ -1155,7 +1155,7 @@ def find_orphaned_processes() -> list[PortInfo]:
 @dataclass
 class KillResult:
     port: int
-    pid: int
+    pid: int | None  # None when nothing listened on the port to begin with
     ok: bool  # True only when nothing listens on the port any more
     detail: str
 

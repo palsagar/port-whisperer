@@ -5,12 +5,13 @@ from typing import cast
 
 from rich import box
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from rich.tree import Tree
 
-from portwhisperer.scanner import PortInfo, ProcessInfo
+from portwhisperer.scanner import KillResult, PortInfo, ProcessInfo
 
 console = Console()
 
@@ -460,6 +461,61 @@ def display_clean_results(
         f_count = len(failed)
         noun = "processes" if f_count != 1 else "process"
         console.print(f"[red]  Failed to clean {f_count} {noun}.[/]")
+    console.print()
+
+
+def _target_label(p: PortInfo) -> str:
+    """Describe what a kill would stop: the container, or the process and PID."""
+    if p.container:
+        return f"container {escape(p.container)}"
+    return f"{escape(p.process_name)} [dim](PID {p.pid})[/]"
+
+
+def display_kill_targets(targets: list[PortInfo]) -> None:
+    """List the ports that ``ports kill`` is about to free.
+
+    Parameters
+    ----------
+    targets : list[PortInfo]
+        Ports to free.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        display_kill_targets([get_port_details(3000)])
+    """
+    console.print()
+    for p in targets:
+        console.print(
+            f"  [dim]•[/] :[bold white]{p.port}[/] [dim]—[/] {_target_label(p)}"
+        )
+    console.print()
+
+
+def display_kill_results(results: list[KillResult]) -> None:
+    """Print one line per port with the outcome of a kill.
+
+    Parameters
+    ----------
+    results : list[KillResult]
+        Outcomes from :func:`~portwhisperer.scanner.free_port`.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        display_kill_results([free_port(info)])
+    """
+    console.print()
+    for r in results:
+        icon = "[green]✓[/]" if r.ok else "[red]✕[/]"
+        style = "green" if r.ok else "red"
+        pid = f" [dim](PID {r.pid})[/]" if r.pid is not None else ""
+        console.print(
+            f"  {icon} :[bold white]{r.port}[/]{pid} [dim]—[/] "
+            f"[{style}]{escape(r.detail)}[/]"
+        )
     console.print()
 
 

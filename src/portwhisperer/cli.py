@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import re
+import sys
 
 import click
 from rich.console import Console
 
 from portwhisperer.display import (
     display_clean_results,
+    display_kill_results,
+    display_kill_targets,
     display_port_detail,
     display_port_table,
     display_process_table,
@@ -14,6 +17,7 @@ from portwhisperer.display import (
     display_watch_header,
 )
 from portwhisperer.scanner import (
+    KillResult,
     ProcessInfo,
     find_orphaned_processes,
     free_port,
@@ -44,6 +48,19 @@ class _PortGroup(click.Group):
             except ValueError:
                 pass
         return super().parse_args(ctx, args)
+
+
+def _stdin_is_tty() -> bool:
+    """Return True when a person can answer prompts on stdin.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        if _stdin_is_tty():
+            click.confirm("Kill?")
+    """
+    return sys.stdin.isatty()
 
 
 def _parse_memory_to_kb(memory: str | None) -> float:
@@ -244,6 +261,36 @@ def clean() -> None:
         display_clean_results(orphaned, killed=killed, failed=failed)
     else:
         console.print("[dim]\n  Aborted.\n[/]")
+
+
+@main.command()
+@click.argument("port_numbers", metavar="PORT...", nargs=-1, required=True, type=int)
+@click.option("--force", is_flag=True, help="Send SIGKILL (or docker kill) right away")
+@click.option("--yes", "-y", is_flag=True, help="Do not ask for confirmation")
+def kill(port_numbers: tuple[int, ...], force: bool, yes: bool) -> None:
+    """Free the given ports and exit 0 only if all of them end up free."""
+    by_port = {p.port: p for p in get_listening_ports()}
+    requested = list(dict.fromkeys(port_numbers))
+    targets = [by_port[n] for n in requested if n in by_port]
+
+    if targets and not yes:
+        if not _stdin_is_tty():
+            console.print("[red]  stdin is not a terminal. Pass --yes to kill.[/]")
+            sys.exit(1)
+        display_kill_targets(targets)
+        noun = "this" if len(targets) == 1 else f"these {len(targets)}"
+        if not click.confirm(f"  Kill {noun}?", default=False):
+            console.print("[dim]\n  Aborted.\n[/]")
+            sys.exit(1)
+
+    results = {t.port: free_port(t, force=force) for t in targets}
+    ordered = [
+        results.get(n) or KillResult(n, None, False, f"nothing listens on :{n}")
+        for n in requested
+    ]
+    display_kill_results(ordered)
+    if not all(r.ok for r in ordered):
+        sys.exit(1)
 
 
 @main.command()
