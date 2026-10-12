@@ -410,8 +410,39 @@ def test_missing_binaries(monkeypatch):
     assert scanner._batch_docker_info() == {}
     assert scanner._get_process_tree(1) == []
     assert scanner._get_git_branch("/tmp") is None
-    assert scanner.get_listening_ports() == []
     assert scanner.get_all_processes() == []
+    # Except the port scan: an empty list would claim every port is free
+    with pytest.raises(scanner.ScanError, match="not installed"):
+        scanner.get_listening_ports()
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "stderr", "fails"),
+    [
+        (1, "", "", False),  # no listener at all
+        (1, "", "lsof: unknown option", True),
+        (0, "COMMAND PID\n", "", False),
+    ],
+)
+def test_listening_ports_scan_errors(monkeypatch, returncode, stdout, stderr, fails):
+    def run(args, **kwargs):
+        return subprocess.CompletedProcess(args, returncode, stdout, stderr)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    if fails:
+        with pytest.raises(scanner.ScanError, match="unknown option"):
+            scanner.get_listening_ports()
+    else:
+        assert scanner.get_listening_ports() == []
+
+
+def test_listening_ports_timeout(monkeypatch):
+    def run(args, **kwargs):
+        raise subprocess.TimeoutExpired(args, 10)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    with pytest.raises(scanner.ScanError, match="10 seconds"):
+        scanner.get_listening_ports()
 
 
 # ── find_clean_candidates ─────────────────────────────────────────────────────
@@ -642,6 +673,29 @@ def test_watch_detects_restart_on_same_port(monkeypatch):
 def test_watch_filters_to_dev_processes(monkeypatch):
     polls = [[_p(3000, 1), _p(7000, 2, "ControlCenter")], [_p(3000, 1)]]
     assert _watch(monkeypatch, polls) == [("snapshot", [3000])]
+
+
+def test_watch_skips_a_failed_scan(monkeypatch):
+    series = iter([[_p(3000, 1)], None, [_p(3000, 1)]])
+
+    def scan():
+        ports = next(series)
+        if ports is None:
+            raise scanner.ScanError("lsof failed")
+        return ports
+
+    monkeypatch.setattr(scanner, "get_listening_ports", scan)
+    sleeps = iter(range(2))
+
+    def fake_sleep(seconds: float) -> None:
+        if next(sleeps, None) is None:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(scanner.time, "sleep", fake_sleep)
+    events: list[str] = []
+    scanner.watch_ports(lambda kind, data: events.append(kind), 0.2)
+    # No CLOSED for the failed scan, no NEW when it recovers
+    assert events == ["snapshot"]
 
 
 def test_watch_all_shows_everything(monkeypatch):

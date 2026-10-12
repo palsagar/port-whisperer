@@ -55,6 +55,14 @@ class ProcessInfo:
     tool: str | None = None  # tool run by an interpreter, e.g. "vite" for node
 
 
+class ScanError(RuntimeError):
+    """Raised when ``lsof`` cannot list the listening ports.
+
+    An empty list would claim that every port is free, so callers that act
+    on "free" (``ports <port>``, ``ports next``) must see the failure.
+    """
+
+
 # ── private helpers ───────────────────────────────────────────────────────────
 
 # python, python3, and versioned binaries such as python3.12 or python3.13
@@ -1117,6 +1125,11 @@ def get_listening_ports() -> list[PortInfo]:
     list[PortInfo]
         Ports sorted by port number ascending.
 
+    Raises
+    ------
+    ScanError
+        When ``lsof`` is missing, times out, or reports an error.
+
     Examples
     --------
     .. code-block:: python
@@ -1126,19 +1139,22 @@ def get_listening_ports() -> list[PortInfo]:
     """
     try:
         proc = subprocess.run(
-            # +c 0 stops lsof from cutting process names to 9 characters
-            ["lsof", "+c", "0", "-iTCP", "-sTCP:LISTEN", "-P", "-n"],
+            # +c 0 stops lsof from cutting process names to 9 characters;
+            # -w hides harmless warnings, so anything on stderr is a real error
+            ["lsof", "-w", "+c", "0", "-iTCP", "-sTCP:LISTEN", "-P", "-n"],
             capture_output=True,
             text=True,
             timeout=10,
         )
-        raw = proc.stdout
-    except (
-        subprocess.TimeoutExpired,
-        subprocess.CalledProcessError,
-        FileNotFoundError,
-    ):
-        return []
+    except FileNotFoundError as exc:
+        raise ScanError("lsof is not installed") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ScanError("lsof did not answer within 10 seconds") from exc
+    raw = proc.stdout
+    # lsof exits 1 both for "no match" and for errors; only errors print
+    if proc.returncode != 0 and not raw.strip() and proc.stderr.strip():
+        error = re.sub(r"[\x00-\x1f\x7f]", " ", proc.stderr.strip())
+        raise ScanError(f"lsof failed: {error}")
 
     lines = raw.strip().splitlines()
     if not lines:
@@ -1526,6 +1542,10 @@ def is_docker_process(name: str) -> bool:
         or name.startswith("Docker")
         or name in ("docker", "docker-sandbox")
     )
+
+
+# Process names that container_engine can classify only with the command line
+_NEEDS_COMMAND = {"ssh"}
 
 
 def container_engine(name: str, command: str = "") -> str | None:
@@ -1959,7 +1979,21 @@ def free_port(info: PortInfo, force: bool = False) -> KillResult:
         )
     if info.container:
         return _stop_container(info, force)
-    engine = container_engine(info.raw_name, info.command)
+    command = info.command
+    if not command and info.raw_name in _NEEDS_COMMAND:
+        # The batched ps call failed for this PID. Without the command line a
+        # Lima ssh forwarder looks like any ssh tunnel, so ask again.
+        command = _batch_ps_info([info.pid]).get(info.pid, {}).get("command", "")
+        if not command:
+            return KillResult(
+                info.port,
+                info.pid,
+                False,
+                f"could not read the command line of PID {info.pid} "
+                f"({info.raw_name}), so it may be a container engine's port "
+                "forwarder. Nothing was signalled",
+            )
+    engine = container_engine(info.raw_name, command)
     if engine:
         return KillResult(
             info.port,
@@ -2018,7 +2052,9 @@ def watch_ports(
         Called once with ``("snapshot", list[PortInfo])`` for the ports open
         at the start, then with ``("new", PortInfo)``,
         ``("restarted", PortInfo)`` (same port, new PID) or
-        ``("closed", PortInfo)`` (the last info seen for that port).
+        ``("closed", PortInfo)`` (the last info seen for that port). A failed
+        scan after the first one is skipped; the first one raises
+        :class:`ScanError`.
     interval : float
         Polling interval in seconds (default: 2.0).
     dev_only : bool
@@ -2045,7 +2081,12 @@ def watch_ports(
     try:
         while True:
             time.sleep(interval)
-            current = poll()
+            try:
+                current = poll()
+            except ScanError:
+                # A failed scan says nothing about the ports; try again on
+                # the next tick instead of reporting every port as closed
+                continue
             for port, info in current.items():
                 if port not in previous:
                     callback("new", info)

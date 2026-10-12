@@ -258,12 +258,13 @@ ports --json | jq '.[] | select(.address != "127.0.0.1") | .port'
 | 0 | A process listens on the port. |
 | 1 | The port is free. With `--json`, nothing is printed. |
 | 2 | The argument is not a valid port (1–65535). |
+| 3 | The ports could not be checked, for example because `lsof` failed. |
 
 ```bash
 ports 3000 --json > /dev/null || npm run dev    # start the server only if :3000 is free
 ```
 
-`ports kill` exits 0 only when every port ends up free. `ports open` exits 1 when nothing listens on the port.
+`ports kill` exits 0 only when every port ends up free. `ports open` exits 1 when nothing listens on the port. Every command exits 3 when the `lsof` scan fails, so a failed scan never passes for a free port.
 
 ## Configuration
 

@@ -505,3 +505,24 @@ def test_new_command_names_are_not_ports(monkeypatch, detail_calls, name):
 def test_bare_port_still_routes_next_to_new_commands(detail_calls):
     CliRunner().invoke(cli.main, ["3000"])
     assert detail_calls == [3000]
+
+
+# ── scan failures ─────────────────────────────────────────────────────────────
+
+
+def _failing_scan() -> list[PortInfo]:
+    raise cli.ScanError("lsof failed: boom")
+
+
+@pytest.mark.parametrize(
+    "args",
+    [["3000", "--json"], ["3000"], ["next"], ["open", "3000"], ["here"], []],
+)
+def test_failed_scan_exits_3_and_never_claims_free(monkeypatch, args):
+    monkeypatch.setattr(cli, "get_listening_ports", _failing_scan)
+    monkeypatch.setattr(cli, "get_port_details", lambda port: _failing_scan())
+    monkeypatch.setattr(cli, "find_project_root", lambda cwd: "/repo")
+    result = CliRunner().invoke(cli.main, args)
+    assert result.exit_code == 3
+    assert "Could not check the ports" in result.output
+    assert "3000\n" not in result.output

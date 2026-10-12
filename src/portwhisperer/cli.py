@@ -25,6 +25,7 @@ from portwhisperer.scanner import (
     KillResult,
     PortInfo,
     ProcessInfo,
+    ScanError,
     find_clean_candidates,
     find_project_root,
     free_port,
@@ -62,6 +63,14 @@ class _PortGroup(click.Group):
                     )
                 args = ["--whoisonport", args[0], *args[1:]]
         return super().parse_args(ctx, args)
+
+    def invoke(self, ctx: click.Context) -> object:
+        # A failed lsof scan must not pass for "nothing listens": exit 3
+        try:
+            return super().invoke(ctx)
+        except ScanError as exc:
+            click.echo(f"Error: {exc}. Could not check the ports.", err=True)
+            ctx.exit(3)
 
 
 def _stdin_is_tty() -> bool:
@@ -248,7 +257,8 @@ def main(
 
     \b
     ports <port> exits 0 when a process listens on the port, 1 when the port
-    is free, and 2 when the argument is not a valid port.
+    is free, 2 when the argument is not a valid port, and 3 when the ports
+    could not be checked.
     """
     # The banner is decoration for people; pipes and files get plain data
     set_banner(not quiet and _stdout_is_tty())

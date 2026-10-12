@@ -545,3 +545,36 @@ def test_socket_check_resolves_symlinks(monkeypatch, fake_run, signals, tmp_path
     assert scanner.free_port(_backend()).ok
     (call,) = fake_run.commands("-F pc")
     assert call.endswith(f"-- {real.resolve()}")
+
+
+def test_ssh_without_command_is_looked_up_again(monkeypatch, fake_run, signals):
+    # The batched ps failed, so the listing has no command for the forwarder
+    fake_run.outputs["ps_batch.txt"] = (
+        f" 1500  1450 S  2048 Mon Oct 12 09:00:00 2026     {COLIMA_SSH}\n"
+    )
+    calls = _listeners(monkeypatch, lambda: {1500})
+    info = _node(port=5432, pid=1500, process_name="ssh", raw_name="ssh", command="")
+    result = scanner.free_port(info, force=True)
+    assert signals == []
+    assert calls == []
+    assert "every port it forwards" in result.detail
+
+
+def test_ssh_with_unreadable_command_gets_no_signal(monkeypatch, fake_run, signals):
+    fake_run.outputs["ps_batch.txt"] = ""
+    _listeners(monkeypatch, lambda: {1500})
+    info = _node(port=5432, pid=1500, process_name="ssh", raw_name="ssh", command="")
+    result = scanner.free_port(info, force=True)
+    assert signals == []
+    assert not result.ok
+    assert "could not read the command line" in result.detail
+
+
+def test_plain_ssh_tunnel_can_still_be_killed(monkeypatch, fake_run, signals):
+    fake_run.outputs["ps_batch.txt"] = (
+        " 1500  1450 S  2048 Mon Oct 12 09:00:00 2026     ssh -L 5432:db:5432 b\n"
+    )
+    _listeners(monkeypatch, lambda: set() if signals else {1500})
+    info = _node(port=5432, pid=1500, process_name="ssh", raw_name="ssh", command="")
+    assert scanner.free_port(info).ok
+    assert signals == [(1500, signal.SIGTERM)]
