@@ -337,17 +337,22 @@ def test_detect_framework_from_image(image, expected):
         ("zsh", "", False),
         # Blocklist wins over a matching command line
         ("Slack", "node /Applications/Slack.app/app.js", False),
-        ("ControlCenter", "", False),
+        ("ControlCenter", "node x.js", False),
         ("code", "node extension-host.js", False),
+        # Entry followed by a space or a dot still counts as the same app
+        ("Code Helper (Plugin)", "node extension-host.js", False),
+        ("Google Chrome", "node x.js", False),
+        ("zoom.us", "node x.js", False),
         # A versioned binary still passes when its command has a dev pattern
         ("python3.13", "python3.13 -m uvicorn app:app", True),
         ("python3.12", "", True),
         ("python3.13", "python3.13 -m http.server", True),
         ("pythonista", "", False),
-        # bug: see #2 — blocklist prefixes hide unrelated tools
-        ("codex", "node /opt/codex/bin/codex.js", False),
-        ("codegen", "node codegen.js", False),
-        ("archiver", "node archive.js", False),
+        # Blocklist entries do not hide tools that only share a prefix
+        ("codex", "node /opt/codex/bin/codex.js", True),
+        ("codex-code-mode-host", "node host.js", True),
+        ("codegen", "node codegen.js", True),
+        ("archiver", "node archive.js", True),
     ],
 )
 def test_is_dev_process(name, command, expected):

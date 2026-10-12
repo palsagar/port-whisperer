@@ -693,10 +693,10 @@ def is_dev_process(name: str, command: str) -> bool:
         "postman",
         "linear",
         "cursor",
-        "controlce",
+        "controlcenter",
         "rapportd",
-        "superhuma",
-        "setappage",
+        "superhuman",
+        "setappagent",
         "slack",
         "discord",
         "firefox",
@@ -713,23 +713,25 @@ def is_dev_process(name: str, command: str) -> bool:
         "arc",
         "loginwindow",
         "windowserver",
-        "systemuise",
+        "systemuiserver",
         "kernel_task",
         "launchd",
         "mdworker",
         "mds_stores",
         "cfprefsd",
         "coreaudio",
-        "corebrightne",
+        "corebrightnessd",
         "airportd",
         "bluetoothd",
         "sharingd",
         "usernoted",
-        "notificationc",
+        "notificationcenter",
         "cloudd",
     ]
     for app in system_apps:
-        if n.startswith(app):
+        # Exact name, or the name followed by a space or dot ("Code Helper",
+        # "zoom.us"), so "code" does not hide "codex" or "codegen"
+        if n == app or n.startswith((app + " ", app + ".")):
             return False
 
     # Dev process names — exact match on basename
