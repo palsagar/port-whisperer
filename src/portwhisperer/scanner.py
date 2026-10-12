@@ -28,6 +28,8 @@ class PortInfo:
     memory: str | None = None
     git_branch: str | None = None
     process_tree: list = field(default_factory=list)
+    ppid: int | None = None
+    container: str | None = None  # Docker container name for container ports
 
 
 @dataclass
@@ -948,6 +950,7 @@ def get_listening_ports() -> list[PortInfo]:
 
         # Status and uptime from batched ps
         if ps:
+            info.ppid = ps["ppid"]
             if "Z" in ps["stat"]:
                 info.status = "zombie"
             elif ps["ppid"] == 1 and is_dev_process(process_name, ps["command"]):
@@ -973,6 +976,7 @@ def get_listening_ports() -> list[PortInfo]:
         docker = docker_map.get(port)
         if docker:
             info.project_name = docker["name"]
+            info.container = docker["name"]
             info.framework = _detect_framework_from_image(docker["image"])
             info.process_name = "docker"
 
@@ -1148,33 +1152,266 @@ def find_orphaned_processes() -> list[PortInfo]:
     return [p for p in ports if p.status in ("orphaned", "zombie")]
 
 
-def kill_process(pid: int, sig: int = signal.SIGTERM) -> bool:
-    """Send a signal to a process.
+@dataclass
+class KillResult:
+    port: int
+    pid: int
+    ok: bool  # True only when nothing listens on the port any more
+    detail: str
+
+
+# Seconds to wait for the port after SIGTERM, then after SIGKILL or docker stop
+_TERM_TIMEOUT = 3.0
+_KILL_TIMEOUT = 2.0
+_POLL_INTERVAL = 0.1
+
+
+def is_docker_process(name: str) -> bool:
+    """Return True when the process name belongs to the Docker family.
 
     Parameters
     ----------
-    pid : int
-        Target process ID.
-    sig : int
-        Signal to send (default: SIGTERM).
+    name : str
+        Process name to check.
 
     Returns
     -------
     bool
-        True on success, False if the process was not found or permission denied.
+        True for com.docker.*, Docker*, docker, and docker-sandbox.
 
     Examples
     --------
     .. code-block:: python
 
-        success = kill_process(1234)
-        print(success)  # True
+        is_docker_process("com.docker.backend")  # True
+        is_docker_process("node")                # False
+    """
+    return (
+        name.startswith("com.docke")
+        or name.startswith("Docker")
+        or name in ("docker", "docker-sandbox")
+    )
+
+
+def _port_listener_pids(port: int) -> set[int] | None:
+    """Return the PIDs that listen on a TCP port.
+
+    Parameters
+    ----------
+    port : int
+        The TCP port to check.
+
+    Returns
+    -------
+    set[int] | None
+        The listening PIDs, an empty set when the port is free, or None when
+        ``lsof`` could not run.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        if not _port_listener_pids(3000):
+            print("port 3000 is free")
     """
     try:
-        os.kill(pid, sig)
-        return True
-    except OSError:
-        return False
+        proc = subprocess.run(
+            ["lsof", "-t", f"-iTCP:{port}", "-sTCP:LISTEN", "-P", "-n"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    return {int(pid) for pid in proc.stdout.split() if pid.isdigit()}
+
+
+def _wait_for_release(port: int, pid: int, timeout: float) -> bool:
+    """Poll until ``pid`` no longer listens on ``port`` or ``timeout`` passes.
+
+    Parameters
+    ----------
+    port : int
+        The TCP port to watch.
+    pid : int
+        The process expected to let go of the port.
+    timeout : float
+        Seconds to wait.
+
+    Returns
+    -------
+    bool
+        True if the process let go of the port in time.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        _wait_for_release(3000, 41000, timeout=3.0)
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        listeners = _port_listener_pids(port)
+        if listeners is not None and pid not in listeners:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_POLL_INTERVAL)
+
+
+def _port_free_result(info: PortInfo) -> KillResult:
+    """Build the final result from one last look at the port.
+
+    Parameters
+    ----------
+    info : PortInfo
+        The port that was targeted.
+
+    Returns
+    -------
+    KillResult
+        Success only when nothing listens on the port.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        result = _port_free_result(info)
+    """
+    listeners = _port_listener_pids(info.port)
+
+    def fail(detail: str) -> KillResult:
+        return KillResult(info.port, info.pid, False, detail)
+
+    if listeners is None:
+        return fail(f"could not check whether :{info.port} is free (lsof failed)")
+    if not listeners:
+        return KillResult(info.port, info.pid, True, f":{info.port} is free")
+    if info.pid in listeners:
+        return fail(f"PID {info.pid} still listens on :{info.port}")
+    # The old process is gone but something restarted the server
+    others = ", ".join(str(p) for p in sorted(listeners))
+    return fail(
+        f"PID {info.pid} stopped, but PID {others} took :{info.port} again. "
+        "A parent watcher (nodemon, npm run dev) probably restarted it"
+    )
+
+
+def _stop_container(info: PortInfo, force: bool) -> KillResult:
+    """Stop the Docker container behind a port, then check that the port is free.
+
+    Parameters
+    ----------
+    info : PortInfo
+        A port whose ``container`` is set.
+    force : bool
+        Use ``docker kill`` instead of ``docker stop``.
+
+    Returns
+    -------
+    KillResult
+        The outcome for the port.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        _stop_container(info, force=False)  # runs "docker stop <name>"
+    """
+    action = "kill" if force else "stop"
+    name = info.container or ""
+    try:
+        # docker stop waits up to 10 s for the container before it kills it
+        proc = subprocess.run(
+            ["docker", action, name],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except FileNotFoundError:
+        return KillResult(info.port, info.pid, False, "the docker CLI is not found")
+    except subprocess.TimeoutExpired:
+        return KillResult(
+            info.port, info.pid, False, f"docker {action} {name} timed out"
+        )
+    if proc.returncode != 0:
+        error = proc.stderr.strip() or f"exit code {proc.returncode}"
+        return KillResult(
+            info.port, info.pid, False, f"docker {action} {name} failed: {error}"
+        )
+
+    _wait_for_release(info.port, info.pid, _KILL_TIMEOUT)
+    return _port_free_result(info)
+
+
+def free_port(info: PortInfo, force: bool = False) -> KillResult:
+    """Stop whatever listens on a port and report success only once it is free.
+
+    - A Docker container port runs ``docker stop`` (or ``docker kill`` with
+      ``force``). Docker's own processes never receive a signal, because that
+      would stop every container.
+    - A zombie has already exited, so it gets no signal. Only its parent can
+      remove it.
+    - Any other process gets SIGTERM, then SIGKILL if it still holds the port
+      after ``_TERM_TIMEOUT`` seconds. ``force`` sends SIGKILL at once.
+
+    Parameters
+    ----------
+    info : PortInfo
+        The port to free, from :func:`get_listening_ports`.
+    force : bool
+        Skip the graceful step.
+
+    Returns
+    -------
+    KillResult
+        ``ok`` is True only if nothing listens on the port afterwards.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        result = free_port(get_port_details(3000))
+        print(result.ok, result.detail)
+    """
+    if info.status == "zombie":
+        parent = f"PID {info.ppid}" if info.ppid else "its parent"
+        return KillResult(
+            info.port,
+            info.pid,
+            False,
+            f"PID {info.pid} is a zombie: it has already exited and no signal "
+            f"can remove it. Only its parent ({parent}) can reap it",
+        )
+    if info.container:
+        return _stop_container(info, force)
+    if is_docker_process(info.raw_name):
+        return KillResult(
+            info.port,
+            info.pid,
+            False,
+            f"PID {info.pid} is Docker's own process; signalling it would stop "
+            "every container. No container was found for this port (is the "
+            "docker CLI installed?)",
+        )
+
+    steps = [signal.SIGKILL] if force else [signal.SIGTERM, signal.SIGKILL]
+    for sig in steps:
+        try:
+            os.kill(info.pid, sig)
+        except ProcessLookupError:
+            break  # already gone; the final check decides
+        except PermissionError:
+            return KillResult(
+                info.port,
+                info.pid,
+                False,
+                f"permission denied. Try: sudo kill {info.pid}",
+            )
+        timeout = _TERM_TIMEOUT if sig == signal.SIGTERM else _KILL_TIMEOUT
+        if _wait_for_release(info.port, info.pid, timeout):
+            break
+    return _port_free_result(info)
 
 
 def watch_ports(callback: Callable, interval: float = 2.0) -> None:

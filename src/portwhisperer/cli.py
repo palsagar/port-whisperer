@@ -16,11 +16,12 @@ from portwhisperer.display import (
 from portwhisperer.scanner import (
     ProcessInfo,
     find_orphaned_processes,
+    free_port,
     get_all_processes,
     get_listening_ports,
     get_port_details,
     is_dev_process,
-    kill_process,
+    is_docker_process,
     watch_ports,
 )
 
@@ -43,33 +44,6 @@ class _PortGroup(click.Group):
             except ValueError:
                 pass
         return super().parse_args(ctx, args)
-
-
-def _is_docker_process(name: str) -> bool:
-    """Return True when the process name belongs to the Docker family.
-
-    Parameters
-    ----------
-    name : str
-        Process name to check.
-
-    Returns
-    -------
-    bool
-        True for com.docker.*, Docker*, docker, and docker-sandbox.
-
-    Examples
-    --------
-    .. code-block:: python
-
-        _is_docker_process("com.docker.backend")  # True
-        _is_docker_process("node")                # False
-    """
-    return (
-        name.startswith("com.docke")
-        or name.startswith("Docker")
-        or name in ("docker", "docker-sandbox")
-    )
 
 
 def _parse_memory_to_kb(memory: str | None) -> float:
@@ -160,8 +134,8 @@ def _collapse_docker(processes: list[ProcessInfo]) -> list[ProcessInfo]:
 
         collapsed = _collapse_docker(dev_processes)
     """
-    docker_procs = [p for p in processes if _is_docker_process(p.process_name)]
-    non_docker = [p for p in processes if not _is_docker_process(p.process_name)]
+    docker_procs = [p for p in processes if is_docker_process(p.process_name)]
+    non_docker = [p for p in processes if not is_docker_process(p.process_name)]
 
     if not docker_procs:
         return non_docker
@@ -201,11 +175,11 @@ def main(ctx: click.Context, show_all: bool, whoisonport: int | None) -> None:
         info = get_port_details(whoisonport)
         display_port_detail(info)
         if info and click.confirm(f"  Kill process on :{whoisonport}?", default=False):
-            success = kill_process(info.pid)
-            if success:
+            result = free_port(info)
+            if result.ok:
                 console.print(f"\n  [green]✓ Killed PID {info.pid}[/]\n")
             else:
-                console.print(f"\n  [red]✕ Failed. Try: sudo kill -9 {info.pid}[/]\n")
+                console.print(f"\n  [red]✕ Failed: {result.detail}[/]\n")
         return
 
     # Default: show port table, filtered to dev servers unless --all
@@ -263,7 +237,7 @@ def clean() -> None:
 
     if click.confirm("  Kill all?", default=False):
         for p in orphaned:
-            if kill_process(p.pid):
+            if free_port(p).ok:
                 killed.append(p.pid)
             else:
                 failed.append(p.pid)

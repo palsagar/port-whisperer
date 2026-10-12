@@ -11,14 +11,18 @@ from portwhisperer import scanner
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
-# Most specific match first: "lsof -a -d cwd" must not hit the LISTEN route.
+# Most specific match first: "lsof -a -d cwd" and "lsof -t" must not hit the
+# LISTEN route.
 ROUTES: list[tuple[str, str]] = [
+    ("lsof -t", "lsof_pids.txt"),
     ("-sTCP:LISTEN", "lsof_listen.txt"),
     ("-d cwd", "lsof_cwd.txt"),
     ("ps -p", "ps_batch.txt"),
     ("pid=,ppid=,comm=", "ps_tree.txt"),
     ("pcpu=", "ps_all.txt"),
     ("docker ps", "docker_ps.txt"),
+    ("docker stop", "docker_stop.txt"),
+    ("docker kill", "docker_stop.txt"),
 ]
 
 # The frozen "now" used for uptime assertions.
