@@ -261,7 +261,8 @@ ports --json | jq '.[] | select(.address != "127.0.0.1") | .port'
 | 3 | The ports could not be checked, for example because `lsof` failed. |
 
 ```bash
-ports 3000 --json > /dev/null || npm run dev    # start the server only if :3000 is free
+# Start the server only if :3000 is free (exit 1). Exit 3 means the check failed.
+ports 3000 --json > /dev/null; [ $? -eq 1 ] && npm run dev
 ```
 
 `ports kill` exits 0 only when every port ends up free. `ports open` exits 1 when nothing listens on the port. Every command exits 3 when the `lsof` scan fails, so a failed scan never passes for a free port.
