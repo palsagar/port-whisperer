@@ -124,8 +124,8 @@ def test_framework(ports):
     assert ports[3000].framework == "Next.js"
     assert ports[3001].framework == "Node.js"
     assert ports[37777].framework is None
-    # bug: see #2 — "next" inside the path "nextcloud-sync" wins over package.json
-    assert ports[4000].framework == "Next.js"
+    # "next" inside the directory name "nextcloud-sync" no longer counts
+    assert ports[4000].framework == "Node.js"
     # Versioned binary name falls back to Python
     assert ports[8000].framework == "Python"
 
@@ -237,12 +237,16 @@ def test_all_processes_skip_own_pid(fake_run, frozen_now, monkeypatch):
         ("", "unknown", None),
         ("", "python3.13", "Python"),
         ("", "pythonista", None),
-        # bug: see #2 — substring matches inside unrelated words and paths
-        ("node /Users/me/nextcloud-sync/server.js", "node", "Next.js"),
-        ("node /srv/invite-service/index.js", "node", "Vite"),
-        ("python /data/disastrous/app.py", "python", "Astro"),
-        ("node /srv/escargot/index.js", "node", "Rust"),
-        ("python /srv/guardrails/app.py", "python", "Rails"),
+        ("django-admin runserver", "python3", "Django"),
+        ("node /app/node_modules/.bin/webpack-dev-server", "node", "Webpack"),
+        ("/usr/local/bin/cargo run --release", "cargo", "Rust"),
+        # Framework words inside other words or directory names do not match
+        ("node /Users/me/nextcloud-sync/server.js", "node", "Node.js"),
+        ("node /srv/invite-service/index.js", "node", "Node.js"),
+        ("python /data/disastrous/app.py", "python", "Python"),
+        ("node /srv/escargot/index.js", "node", "Node.js"),
+        ("python /srv/guardrails/app.py", "python", "Python"),
+        ("node nextcloud-sync", "node", "Node.js"),
     ],
 )
 def test_detect_framework_from_command(command, name, expected):

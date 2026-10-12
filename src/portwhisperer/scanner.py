@@ -314,34 +314,34 @@ def _detect_framework_from_command(command: str, process_name: str) -> str | Non
     """
     if not command:
         return _detect_framework_from_name(process_name)
-    cmd = command.lower()
 
-    if "next" in cmd:
-        return "Next.js"
-    if "vite" in cmd:
-        return "Vite"
-    if "nuxt" in cmd:
-        return "Nuxt"
-    if "angular" in cmd or "ng serve" in cmd:
-        return "Angular"
-    if "webpack" in cmd:
-        return "Webpack"
-    if "remix" in cmd:
-        return "Remix"
-    if "astro" in cmd:
-        return "Astro"
-    if "gatsby" in cmd:
-        return "Gatsby"
-    if "flask" in cmd:
-        return "Flask"
-    if "django" in cmd or "manage.py" in cmd:
-        return "Django"
-    if "uvicorn" in cmd:
-        return "FastAPI"
-    if "rails" in cmd:
-        return "Rails"
-    if "cargo" in cmd or "rustc" in cmd:
-        return "Rust"
+    # Keep only the basename of each non-flag argument, so directory names in
+    # paths (e.g. /srv/nextcloud-sync/server.js) cannot trigger a match
+    cmd = " ".join(
+        os.path.basename(part)
+        for part in command.lower().split()
+        if not part.startswith("-")
+    )
+
+    # Whole words only — "invite" must not match Vite, "guardrails" not Rails
+    patterns = [
+        (re.compile(r"\bnext\b"), "Next.js"),
+        (re.compile(r"\bvite\b"), "Vite"),
+        (re.compile(r"\bnuxt\b"), "Nuxt"),
+        (re.compile(r"\bangular\b|\bng serve\b"), "Angular"),
+        (re.compile(r"\bwebpack\b"), "Webpack"),
+        (re.compile(r"\bremix\b"), "Remix"),
+        (re.compile(r"\bastro\b"), "Astro"),
+        (re.compile(r"\bgatsby\b"), "Gatsby"),
+        (re.compile(r"\bflask\b"), "Flask"),
+        (re.compile(r"\bdjango\b|\bmanage\.py\b"), "Django"),
+        (re.compile(r"\buvicorn\b"), "FastAPI"),
+        (re.compile(r"\brails\b"), "Rails"),
+        (re.compile(r"\bcargo\b|\brustc\b"), "Rust"),
+    ]
+    for pattern, framework in patterns:
+        if pattern.search(cmd):
+            return framework
 
     return _detect_framework_from_name(process_name)
 
