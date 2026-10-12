@@ -138,3 +138,35 @@ def test_kill_is_a_subcommand_not_a_port(killer, detail_calls):
     result = CliRunner().invoke(cli.main, ["kill", "3000", "-y"])
     assert result.exit_code == 0, result.output
     assert detail_calls == []
+
+
+# ── ports <port> ──────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def detail(monkeypatch: pytest.MonkeyPatch, killer) -> list[tuple[int, bool]]:
+    """Report node on :3000 for the detail view; reuse the kill recorder."""
+    monkeypatch.setattr(cli, "get_port_details", lambda port: _info(port, 41000))
+    return killer
+
+
+def test_detail_prompt_uses_free_port(detail):
+    result = CliRunner().invoke(cli.main, ["3000"], input="y\n")
+    assert result.exit_code == 0, result.output
+    assert detail == [(3000, False)]
+    assert ":3000 is free" in result.output
+
+
+def test_detail_without_tty_does_not_prompt(monkeypatch, detail):
+    monkeypatch.setattr(cli, "_stdin_is_tty", lambda: False)
+    result = CliRunner().invoke(cli.main, ["3000"])
+    assert result.exit_code == 0, result.output
+    assert "[y/N]" not in result.output
+    assert detail == []
+
+
+def test_detail_hint_points_to_ports_kill(monkeypatch, detail):
+    monkeypatch.setattr(cli, "_stdin_is_tty", lambda: False)
+    result = CliRunner().invoke(cli.main, ["3000"])
+    assert "ports kill 3000" in result.output
+    assert "ports clean" not in result.output

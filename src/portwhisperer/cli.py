@@ -191,12 +191,13 @@ def main(ctx: click.Context, show_all: bool, whoisonport: int | None) -> None:
     if whoisonport is not None:
         info = get_port_details(whoisonport)
         display_port_detail(info)
-        if info and click.confirm(f"  Kill process on :{whoisonport}?", default=False):
-            result = free_port(info)
-            if result.ok:
-                console.print(f"\n  [green]✓ Killed PID {info.pid}[/]\n")
-            else:
-                console.print(f"\n  [red]✕ Failed: {result.detail}[/]\n")
+        # Without a terminal nobody can answer, so never prompt (or hang)
+        if (
+            info
+            and _stdin_is_tty()
+            and click.confirm(f"  Kill process on :{whoisonport}?", default=False)
+        ):
+            display_kill_results([free_port(info)])
         return
 
     # Default: show port table, filtered to dev servers unless --all

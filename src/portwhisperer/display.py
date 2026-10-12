@@ -393,10 +393,7 @@ def display_port_detail(info: PortInfo | None) -> None:
         console.print("  ", tree)
 
     console.print()
-    console.print(
-        f"  [dim]Kill this process: [/][cyan]ports clean[/]"
-        f"[dim] or [/][red]kill {info.pid}[/]"
-    )
+    console.print(f"  [dim]Kill this process: [/][cyan]ports kill {info.port}[/]")
     console.print()
 
 
