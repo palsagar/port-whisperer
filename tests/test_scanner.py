@@ -402,6 +402,11 @@ def test_missing_binaries(monkeypatch):
         raise FileNotFoundError(args[0])
 
     monkeypatch.setattr(subprocess, "run", missing)
+    # Every subprocess call degrades to an empty result
+    assert scanner._batch_ps_info([1]) == {}
+    assert scanner._batch_cwd([1]) == {}
     assert scanner._batch_docker_info() == {}
+    assert scanner._get_process_tree(1) == []
     assert scanner._get_git_branch("/tmp") is None
     assert scanner.get_listening_ports() == []
+    assert scanner.get_all_processes() == []
