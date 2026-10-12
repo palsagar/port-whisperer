@@ -1,0 +1,13 @@
+  679     1 S     16240 Tue Mar 24 21:28:04 2026     /usr/libexec/rapportd
+  745     1 S     71264 Tue Mar 24 21:28:05 2026     /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+ 1500  1450 S   2097152 Sun Oct 11 08:00:00 2026     /Applications/Docker.app/Contents/MacOS/com.docker.backend
+ 5555     1 S    409600 Mon Oct 12 08:00:00 2026     /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=9222
+ 9708     1 S    204800 Tue Mar 24 21:30:00 2026     /Applications/Raycast.app/Contents/MacOS/Raycast
+23928 23892 S+    11200 Mon Oct 12 11:37:33 2026     /Users/dev/projects/simulator/.venv/bin/python3 /Users/dev/projects/simulator/.venv/bin/uvicorn simulator.server:app --port 8012
+27660     1 Ss    50576 Mon Oct 12 00:02:08 2026     /Users/dev/.bun/bin/bun /Users/dev/.claude-mem/scripts/worker-service.cjs --daemon
+41000 40990 S    262144 Mon Oct 12 09:00:00 2026     node /Users/dev/projects/webapp/node_modules/.bin/next dev
+41100 40990 S     65536 Mon Oct 12 10:30:00 2026     node /Users/dev/nextcloud-sync/server.js
+41200 40990 S     32768 Mon Oct 12 11:59:30 2026     /opt/homebrew/bin/codex app-server
+41300 40990 Z         0 Mon Oct 12 11:00:00 2026     node /Users/dev/projects/webapp/worker.js
+41400 40990 S     24576 Mon Oct 12 11:00:00 2026     /opt/homebrew/bin/python3.12 -m http.server 8000
+98426     1 Ss   176864 Sat Aug  8 17:35:09 2026     /Users/dev/.magnitude/bin/magnitude-acn

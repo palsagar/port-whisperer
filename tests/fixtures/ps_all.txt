@@ -1,0 +1,6 @@
+    1   0.7  0.1  19024 Tue Mar 24 04:19:02 2026     /sbin/launchd
+  126   0.0  0.4  62272 Mon Oct 12 11:58:14 2026     /Applications/Brave Browser.app/Contents/MacOS/Brave Browser Helper --type=renderer
+ 1500   3.0 12.5 2097152 Sun Oct 11 08:00:00 2026     /Applications/Docker.app/Contents/MacOS/com.docker.backend
+23928   1.2  0.1  11200 Mon Oct 12 11:37:33 2026     /Users/dev/projects/simulator/.venv/bin/python3 /Users/dev/projects/simulator/.venv/bin/uvicorn simulator.server:app --port 8012
+41000  12.5  1.6 262144 Mon Oct 12 09:00:00 2026     node /Users/dev/projects/webapp/node_modules/.bin/next dev
+41000  12.5  1.6 262144 Mon Oct 12 09:00:00 2026     node /Users/dev/projects/webapp/node_modules/.bin/next dev

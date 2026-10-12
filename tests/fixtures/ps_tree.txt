@@ -1,0 +1,5 @@
+    1     0 /sbin/launchd
+23800 23700 -zsh
+23892 23800 /opt/homebrew/bin/uv
+23928 23892 /Users/dev/projects/simulator/.venv/bin/python3
+41000 40990 node

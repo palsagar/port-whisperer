@@ -15,9 +15,11 @@ ports                    # run the CLI
 ruff check src/          # lint
 ruff format src/         # format
 ty check src/            # type check
+uv run pytest            # run tests
 ```
 
-No build step. No tests.
+No build step. Tests live in `tests/`. They monkeypatch `subprocess.run` to serve saved
+`lsof`/`ps`/`docker` output from `tests/fixtures/`, so they run on any OS.
 
 ## Architecture
 

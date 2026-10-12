@@ -46,6 +46,9 @@ class ProcessInfo:
 
 # ── private helpers ───────────────────────────────────────────────────────────
 
+# python, python3, and versioned binaries such as python3.12 or python3.13
+_PYTHON_RE = re.compile(r"python(3(\.\d+)?)?")
+
 
 def _batch_ps_info(pids: list[int]) -> dict[int, dict]:
     """Single ps call to get ppid/stat/rss/lstart/command for all PIDs.
@@ -74,8 +77,7 @@ def _batch_ps_info(pids: list[int]) -> dict[int, dict]:
     pid_list = ",".join(str(p) for p in pids)
     try:
         proc = subprocess.run(
-            f"ps -p {pid_list} -o pid=,ppid=,stat=,rss=,lstart=,command=",
-            shell=True,
+            ["ps", "-p", pid_list, "-o", "pid=,ppid=,stat=,rss=,lstart=,command="],
             capture_output=True,
             text=True,
             timeout=5,
@@ -98,7 +100,11 @@ def _batch_ps_info(pids: list[int]) -> dict[int, dict]:
                 "lstart": m.group(5),
                 "command": m.group(6),
             }
-    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+    except (
+        subprocess.TimeoutExpired,
+        subprocess.CalledProcessError,
+        FileNotFoundError,
+    ):
         pass
     return result
 
@@ -130,8 +136,7 @@ def _batch_cwd(pids: list[int]) -> dict[int, str]:
     pid_list = ",".join(str(p) for p in pids)
     try:
         proc = subprocess.run(
-            f"lsof -a -d cwd -p {pid_list}",
-            shell=True,
+            ["lsof", "-a", "-d", "cwd", "-p", pid_list],
             capture_output=True,
             text=True,
             timeout=10,
@@ -145,7 +150,11 @@ def _batch_cwd(pids: list[int]) -> dict[int, str]:
             path = " ".join(parts[8:])
             if path and path.startswith("/"):
                 result[pid] = path
-    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+    except (
+        subprocess.TimeoutExpired,
+        subprocess.CalledProcessError,
+        FileNotFoundError,
+    ):
         pass
     return result
 
@@ -168,8 +177,7 @@ def _batch_docker_info() -> dict[int, dict]:
     result: dict[int, dict] = {}
     try:
         proc = subprocess.run(
-            'docker ps --format "{{.Ports}}\\t{{.Names}}\\t{{.Image}}"',
-            shell=True,
+            ["docker", "ps", "--format", "{{.Ports}}\\t{{.Names}}\\t{{.Image}}"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -190,7 +198,11 @@ def _batch_docker_info() -> dict[int, dict]:
                 if port not in seen:
                     seen.add(port)
                     result[port] = {"name": name, "image": image}
-    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+    except (
+        subprocess.TimeoutExpired,
+        subprocess.CalledProcessError,
+        FileNotFoundError,
+    ):
         pass
     return result
 
@@ -311,34 +323,40 @@ def _detect_framework_from_command(command: str, process_name: str) -> str | Non
     """
     if not command:
         return _detect_framework_from_name(process_name)
-    cmd = command.lower()
 
-    if "next" in cmd:
-        return "Next.js"
-    if "vite" in cmd:
-        return "Vite"
-    if "nuxt" in cmd:
-        return "Nuxt"
-    if "angular" in cmd or "ng serve" in cmd:
-        return "Angular"
-    if "webpack" in cmd:
-        return "Webpack"
-    if "remix" in cmd:
-        return "Remix"
-    if "astro" in cmd:
-        return "Astro"
-    if "gatsby" in cmd:
-        return "Gatsby"
-    if "flask" in cmd:
-        return "Flask"
-    if "django" in cmd or "manage.py" in cmd:
-        return "Django"
-    if "uvicorn" in cmd:
-        return "FastAPI"
-    if "rails" in cmd:
-        return "Rails"
-    if "cargo" in cmd or "rustc" in cmd:
-        return "Rust"
+    # Keep only the basename of each non-flag argument, so directory names in
+    # paths (e.g. /srv/nextcloud-sync/server.js) cannot trigger a match
+    tokens: list[str] = []
+    packages: list[str] = []
+    for part in command.lower().split():
+        if part.startswith("-"):
+            continue
+        tokens.append(os.path.basename(part))
+        # The package folder under node_modules names the tool being run,
+        # e.g. node_modules/@angular/cli/bin/ng.js
+        packages.extend(re.findall(r"node_modules/((?:@[^/]+/)?[^/]+)", part))
+    # Packages go last so they never split adjacent words such as "ng serve"
+    cmd = " ".join(tokens + packages)
+
+    # Whole words only — "invite" must not match Vite, "guardrails" not Rails
+    patterns = [
+        (re.compile(r"\bnext\b"), "Next.js"),
+        (re.compile(r"\bvite\b"), "Vite"),
+        (re.compile(r"\bnuxt\b"), "Nuxt"),
+        (re.compile(r"\bangular\b|\bng serve\b"), "Angular"),
+        (re.compile(r"\bwebpack\b"), "Webpack"),
+        (re.compile(r"\bremix\b"), "Remix"),
+        (re.compile(r"\bastro\b"), "Astro"),
+        (re.compile(r"\bgatsby\b"), "Gatsby"),
+        (re.compile(r"\bflask\b"), "Flask"),
+        (re.compile(r"\bdjango\b|\bmanage\.py\b"), "Django"),
+        (re.compile(r"\buvicorn\b"), "FastAPI"),
+        (re.compile(r"\brails\b"), "Rails"),
+        (re.compile(r"\bcargo\b|\brustc\b"), "Rust"),
+    ]
+    for pattern, framework in patterns:
+        if pattern.search(cmd):
+            return framework
 
     return _detect_framework_from_name(process_name)
 
@@ -412,7 +430,7 @@ def _detect_framework_from_name(process_name: str) -> str | None:
     name = (process_name or "").lower()
     if name == "node":
         return "Node.js"
-    if name in ("python", "python3"):
+    if _PYTHON_RE.fullmatch(name):
         return "Python"
     if name == "ruby":
         return "Ruby"
@@ -591,8 +609,7 @@ def _get_process_tree(pid: int) -> list[dict]:
     tree: list[dict] = []
     try:
         proc = subprocess.run(
-            "ps -eo pid=,ppid=,comm=",
-            shell=True,
+            ["ps", "-eo", "pid=,ppid=,comm="],
             capture_output=True,
             text=True,
             timeout=5,
@@ -615,9 +632,82 @@ def _get_process_tree(pid: int) -> list[dict]:
             tree.append(proc_info)
             current_pid = proc_info["ppid"]
             depth += 1
-    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+    except (
+        subprocess.TimeoutExpired,
+        subprocess.CalledProcessError,
+        FileNotFoundError,
+    ):
         pass
     return tree
+
+
+def _get_git_branch(directory: str) -> str | None:
+    """Return the current git branch of ``directory``, or None.
+
+    Parameters
+    ----------
+    directory : str
+        Directory inside a git work tree.
+
+    Returns
+    -------
+    str | None
+        Branch name, or None when the directory is not a git repository.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        print(_get_git_branch("/home/user/myapp"))  # "main"
+    """
+    try:
+        git_proc = subprocess.run(
+            # Argument list, not a shell string: the directory comes from lsof
+            # and may contain quotes or $(...)
+            ["git", "-C", directory, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        return git_proc.stdout.strip() or None
+    except (
+        subprocess.TimeoutExpired,
+        subprocess.CalledProcessError,
+        FileNotFoundError,
+    ):
+        return None
+
+
+def _decode_lsof_name(name: str) -> str:
+    """Decode the ``\\xNN`` escapes that lsof writes into the COMMAND column.
+
+    lsof escapes spaces and other unsafe bytes so each line splits cleanly on
+    whitespace, e.g. ``Google\\x20Chrome``.
+
+    Parameters
+    ----------
+    name : str
+        Raw COMMAND value from lsof.
+
+    Returns
+    -------
+    str
+        The name with printable ASCII escapes decoded. Control characters and
+        non-ASCII bytes stay escaped.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        print(_decode_lsof_name("Google\\\\x20Chrome"))  # "Google Chrome"
+    """
+
+    def _unescape(m: re.Match[str]) -> str:
+        char = chr(int(m.group(1), 16))
+        # A process picks its own name, so never let it emit terminal control codes
+        return char if char.isascii() and char.isprintable() else m.group(0)
+
+    return re.sub(r"\\x([0-9a-fA-F]{2})", _unescape, name)
 
 
 # ── public API ────────────────────────────────────────────────────────────────
@@ -658,10 +748,10 @@ def is_dev_process(name: str, command: str) -> bool:
         "postman",
         "linear",
         "cursor",
-        "controlce",
+        "controlcenter",
         "rapportd",
-        "superhuma",
-        "setappage",
+        "superhuman",
+        "setappagent",
         "slack",
         "discord",
         "firefox",
@@ -678,30 +768,30 @@ def is_dev_process(name: str, command: str) -> bool:
         "arc",
         "loginwindow",
         "windowserver",
-        "systemuise",
+        "systemuiserver",
         "kernel_task",
         "launchd",
         "mdworker",
         "mds_stores",
         "cfprefsd",
         "coreaudio",
-        "corebrightne",
+        "corebrightnessd",
         "airportd",
         "bluetoothd",
         "sharingd",
         "usernoted",
-        "notificationc",
+        "notificationcenter",
         "cloudd",
     ]
     for app in system_apps:
-        if n.startswith(app):
+        # Exact name, or the name followed by a space or dot ("Code Helper",
+        # "zoom.us"), so "code" does not hide "codex" or "codegen"
+        if n == app or n.startswith((app + " ", app + ".")):
             return False
 
     # Dev process names — exact match on basename
     dev_names = {
         "node",
-        "python",
-        "python3",
         "ruby",
         "java",
         "go",
@@ -736,7 +826,7 @@ def is_dev_process(name: str, command: str) -> bool:
         "mix",
         "elixir",
     }
-    if n in dev_names:
+    if n in dev_names or _PYTHON_RE.fullmatch(n):
         return True
 
     # Docker processes (prefix match)
@@ -764,16 +854,12 @@ def is_dev_process(name: str, command: str) -> bool:
     return any(pattern.search(cmd) for pattern in cmd_indicators)
 
 
-def get_listening_ports(detailed: bool = False) -> list[PortInfo]:
+def get_listening_ports() -> list[PortInfo]:
     """Return all TCP ports in LISTEN state with process and project metadata.
 
     Uses a single ``lsof`` call and batches all follow-up lookups to avoid
-    N×6 individual shell calls.
-
-    Parameters
-    ----------
-    detailed : bool
-        When True, also fetch git branch and process tree for each port.
+    N×6 individual shell calls. Git branch and process tree are left empty;
+    :func:`get_port_details` fills them for one port.
 
     Returns
     -------
@@ -789,14 +875,18 @@ def get_listening_ports(detailed: bool = False) -> list[PortInfo]:
     """
     try:
         proc = subprocess.run(
-            "lsof -iTCP -sTCP:LISTEN -P -n",
-            shell=True,
+            # +c 0 stops lsof from cutting process names to 9 characters
+            ["lsof", "+c", "0", "-iTCP", "-sTCP:LISTEN", "-P", "-n"],
             capture_output=True,
             text=True,
             timeout=10,
         )
         raw = proc.stdout
-    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+    except (
+        subprocess.TimeoutExpired,
+        subprocess.CalledProcessError,
+        FileNotFoundError,
+    ):
         return []
 
     lines = raw.strip().splitlines()
@@ -811,7 +901,7 @@ def get_listening_ports(detailed: bool = False) -> list[PortInfo]:
         if len(parts) < 9:
             continue
 
-        process_name = parts[0]
+        process_name = _decode_lsof_name(parts[0])
         pid = int(parts[1])
         name_field = parts[8]
 
@@ -893,24 +983,6 @@ def get_listening_ports(detailed: bool = False) -> list[PortInfo]:
             info.project_name = os.path.basename(project_root)
             info.framework = info.framework or _detect_framework(project_root)
 
-            if detailed:
-                try:
-                    git_proc = subprocess.run(
-                        f'git -C "{info.cwd}" rev-parse --abbrev-ref HEAD',
-                        shell=True,
-                        capture_output=True,
-                        text=True,
-                        timeout=3,
-                    )
-                    branch = git_proc.stdout.strip()
-                    if branch:
-                        info.git_branch = branch
-                except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
-                    pass
-
-        if detailed:
-            info.process_tree = _get_process_tree(pid)
-
         results.append(info)
 
     results.sort(key=lambda p: p.port)
@@ -936,14 +1008,17 @@ def get_all_processes() -> list[ProcessInfo]:
     """
     try:
         proc = subprocess.run(
-            "ps -eo pid=,pcpu=,pmem=,rss=,lstart=,command=",
-            shell=True,
+            ["ps", "-eo", "pid=,pcpu=,pmem=,rss=,lstart=,command="],
             capture_output=True,
             text=True,
             timeout=5,
         )
         raw = proc.stdout.strip()
-    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+    except (
+        subprocess.TimeoutExpired,
+        subprocess.CalledProcessError,
+        FileNotFoundError,
+    ):
         return []
 
     entries: list[dict] = []
@@ -1044,10 +1119,13 @@ def get_port_details(port: int) -> PortInfo | None:
         if details:
             print(details.framework, details.git_branch)
     """
-    ports = get_listening_ports(detailed=True)
-    for p in ports:
-        if p.port == port:
-            return p
+    for info in get_listening_ports():
+        if info.port == port:
+            # Only the requested port pays for the git and process tree lookups
+            if info.cwd:
+                info.git_branch = _get_git_branch(info.cwd)
+            info.process_tree = _get_process_tree(info.pid)
+            return info
     return None
 
 
