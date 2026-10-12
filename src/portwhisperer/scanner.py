@@ -46,6 +46,9 @@ class ProcessInfo:
 
 # ── private helpers ───────────────────────────────────────────────────────────
 
+# python, python3, and versioned binaries such as python3.12 or python3.13
+_PYTHON_RE = re.compile(r"python(3(\.\d+)?)?")
+
 
 def _batch_ps_info(pids: list[int]) -> dict[int, dict]:
     """Single ps call to get ppid/stat/rss/lstart/command for all PIDs.
@@ -412,7 +415,7 @@ def _detect_framework_from_name(process_name: str) -> str | None:
     name = (process_name or "").lower()
     if name == "node":
         return "Node.js"
-    if name in ("python", "python3"):
+    if _PYTHON_RE.fullmatch(name):
         return "Python"
     if name == "ruby":
         return "Ruby"
@@ -725,8 +728,6 @@ def is_dev_process(name: str, command: str) -> bool:
     # Dev process names — exact match on basename
     dev_names = {
         "node",
-        "python",
-        "python3",
         "ruby",
         "java",
         "go",
@@ -761,7 +762,7 @@ def is_dev_process(name: str, command: str) -> bool:
         "mix",
         "elixir",
     }
-    if n in dev_names:
+    if n in dev_names or _PYTHON_RE.fullmatch(n):
         return True
 
     # Docker processes (prefix match)

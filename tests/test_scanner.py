@@ -126,8 +126,8 @@ def test_framework(ports):
     assert ports[37777].framework is None
     # bug: see #2 — "next" inside the path "nextcloud-sync" wins over package.json
     assert ports[4000].framework == "Next.js"
-    # bug: see #2 — python3.12 is not recognised as Python
-    assert ports[8000].framework is None
+    # Versioned binary name falls back to Python
+    assert ports[8000].framework == "Python"
 
 
 def test_default_view_dev_filter(ports):
@@ -136,8 +136,7 @@ def test_default_view_dev_filter(ports):
         for p in ports.values()
         if scanner.is_dev_process(p.process_name, p.command)
     ]
-    # bug: see #2 — 8000 (python3.12 http.server) is hidden
-    assert sorted(dev) == [3000, 3001, 4000, 5432, 8012, 37777]
+    assert sorted(dev) == [3000, 3001, 4000, 5432, 8000, 8012, 37777]
 
 
 def test_listing_skips_git_and_tree(fake_run, frozen_now):
@@ -236,8 +235,8 @@ def test_all_processes_skip_own_pid(fake_run, frozen_now, monkeypatch):
         ("", "python3", "Python"),
         ("", "java", "Java"),
         ("", "unknown", None),
-        # bug: see #2 — versioned binaries miss the name fallback
-        ("", "python3.13", None),
+        ("", "python3.13", "Python"),
+        ("", "pythonista", None),
         # bug: see #2 — substring matches inside unrelated words and paths
         ("node /Users/me/nextcloud-sync/server.js", "node", "Next.js"),
         ("node /srv/invite-service/index.js", "node", "Vite"),
@@ -323,8 +322,9 @@ def test_detect_framework_from_image(image, expected):
         ("code", "node extension-host.js", False),
         # A versioned binary still passes when its command has a dev pattern
         ("python3.13", "python3.13 -m uvicorn app:app", True),
-        # bug: see #2 — versioned Python without a matching command
-        ("python3.13", "python3.13 -m http.server", False),
+        ("python3.12", "", True),
+        ("python3.13", "python3.13 -m http.server", True),
+        ("pythonista", "", False),
         # bug: see #2 — blocklist prefixes hide unrelated tools
         ("codex", "node /opt/codex/bin/codex.js", False),
         ("codegen", "node codegen.js", False),
