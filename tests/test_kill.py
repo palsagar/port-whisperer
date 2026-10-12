@@ -9,6 +9,9 @@ import pytest
 from portwhisperer import scanner
 from portwhisperer.scanner import PortInfo
 
+# Full container ID of dev-postgres in tests/fixtures/docker_ps.txt
+PG_ID = "3f9a1c0e5b7d2a4c6e8f0a1b3c5d7e9f1a2b4c6d8e0f1a3b5c7d9e1f2a4b6c8d"
+
 Signals = list[tuple[int, int]]
 
 
@@ -155,7 +158,11 @@ def test_zombie_gets_no_signal(monkeypatch, signals):
 
 def _backend(**overrides: object) -> PortInfo:
     fields: dict = dict(
-        port=5432, pid=1500, raw_name="com.docker.backend", container="dev-postgres"
+        port=5432,
+        pid=1500,
+        raw_name="com.docker.backend",
+        container="dev-postgres",
+        container_id=PG_ID,
     )
     fields.update(overrides)
     return _node(**fields)
@@ -176,15 +183,9 @@ def _docker_run(fake_run, returncode: int, stderr: str):
 def test_docker_port_stops_container(monkeypatch, fake_run, signals):
     stopped = lambda: fake_run.commands("docker stop")  # noqa: E731
     _listeners(monkeypatch, lambda: set() if stopped() else {1500})
-    info = _node(
-        port=5432,
-        pid=1500,
-        process_name="docker",
-        raw_name="com.docker.backend",
-        container="dev-postgres",
-    )
-    result = scanner.free_port(info)
-    assert fake_run.commands("docker stop") == ["docker stop dev-postgres"]
+    result = scanner.free_port(_backend(process_name="docker"))
+    # Stop by ID: a name can be reused by a different container
+    assert fake_run.commands("docker stop") == [f"docker stop {PG_ID}"]
     # The Docker backend must never receive a signal
     assert signals == []
     assert result.ok
@@ -194,7 +195,7 @@ def test_docker_force_kills_container(monkeypatch, fake_run, signals):
     killed = lambda: fake_run.commands("docker kill")  # noqa: E731
     _listeners(monkeypatch, lambda: set() if killed() else {1500})
     assert scanner.free_port(_backend(), force=True).ok
-    assert fake_run.commands("docker kill") == ["docker kill dev-postgres"]
+    assert fake_run.commands("docker kill") == [f"docker kill {PG_ID}"]
     assert fake_run.commands("docker stop") == []
     assert signals == []
 
@@ -223,6 +224,7 @@ def test_listening_ports_fill_ppid_and_container(fake_run, frozen_now):
     ports = {p.port: p for p in scanner.get_listening_ports()}
     assert ports[3001].ppid == 40990
     assert ports[5432].container == "dev-postgres"
+    assert ports[5432].container_id == PG_ID
     assert ports[3000].container is None
 
 
@@ -274,35 +276,71 @@ def test_docker_stderr_control_characters_are_removed(monkeypatch, fake_run, sig
 # ── challenge-review fixes ────────────────────────────────────────────────────
 
 
+def _ps(*rows: tuple[str, str, str]) -> str:
+    """Build docker ps output from (id, ports, name) rows."""
+    return "".join(f"{cid}\t{ports}\t{name}\timage:1\n" for cid, ports, name in rows)
+
+
 def test_docker_map_ignores_udp(fake_run):
-    fake_run.outputs["docker_ps.txt"] = (
-        "0.0.0.0:5432->5432/tcp\tdev-postgres\tpostgres:15\n"
-        "0.0.0.0:5432->5432/udp\tmetrics\tstatsd\n"
+    fake_run.outputs["docker_ps.txt"] = _ps(
+        ("aaa", "0.0.0.0:5432->5432/tcp", "dev-postgres"),
+        ("bbb", "0.0.0.0:5432->5432/udp", "metrics"),
     )
-    assert scanner._batch_docker_info()[5432]["name"] == "dev-postgres"
+    assert scanner._batch_docker_info()[5432]["id"] == "aaa"
 
 
 def test_docker_map_drops_ambiguous_ports(fake_run):
     # Two containers publish TCP :5432 on different addresses; neither is safe
-    fake_run.outputs["docker_ps.txt"] = (
-        "127.0.0.1:5432->5432/tcp\tpg-a\tpostgres:15\n"
-        "127.0.0.2:5432->5432/tcp\tpg-b\tpostgres:15\n"
+    fake_run.outputs["docker_ps.txt"] = _ps(
+        ("aaa", "127.0.0.1:5432->5432/tcp", "pg-a"),
+        ("bbb", "127.0.0.2:5432->5432/tcp", "pg-b"),
     )
     assert 5432 not in scanner._batch_docker_info()
 
 
+def test_docker_map_drops_ambiguous_ports_across_families(fake_run):
+    fake_run.outputs["docker_ps.txt"] = _ps(
+        ("aaa", "0.0.0.0:5432->5432/tcp", "pg-a"),
+        ("bbb", "[::]:5432->5432/tcp", "pg-b"),
+    )
+    assert 5432 not in scanner._batch_docker_info()
+
+
+@pytest.mark.parametrize("binding", ["[::]:5432", ":::5432", "[::1]:5432"])
+def test_docker_map_reads_ipv6_only(fake_run, binding):
+    fake_run.outputs["docker_ps.txt"] = _ps(("aaa", f"{binding}->5432/tcp", "pg"))
+    assert scanner._batch_docker_info()[5432]["id"] == "aaa"
+
+
 def test_docker_same_container_on_both_families_is_not_ambiguous(fake_run):
-    assert scanner._batch_docker_info()[5432]["name"] == "dev-postgres"
+    assert scanner._batch_docker_info()[5432]["id"] == PG_ID
+
+
+def test_docker_lists_full_ids(fake_run):
+    scanner._batch_docker_info()
+    (call,) = fake_run.commands("docker ps")
+    assert "--no-trunc" in call
 
 
 def test_docker_changed_container_is_refused(monkeypatch, fake_run, signals):
     # Between the prompt and the kill, another container took the port
-    fake_run.outputs["docker_ps.txt"] = "0.0.0.0:5432->5432/tcp\tother\tredis:7\n"
+    fake_run.outputs["docker_ps.txt"] = _ps(("ccc", "0.0.0.0:5432->5432/tcp", "other"))
     _listeners(monkeypatch, lambda: {1500})
     result = scanner.free_port(_backend())
     assert fake_run.commands("docker stop") == []
     assert not result.ok
     assert "other" in result.detail
+
+
+def test_docker_recreated_container_with_same_name_is_refused(
+    monkeypatch, fake_run, signals
+):
+    fake_run.outputs["docker_ps.txt"] = _ps(
+        ("ddd", "0.0.0.0:5432->5432/tcp", "dev-postgres")
+    )
+    _listeners(monkeypatch, lambda: {1500})
+    assert not scanner.free_port(_backend()).ok
+    assert fake_run.commands("docker stop") == []
 
 
 def test_docker_port_already_free_is_not_stopped(monkeypatch, fake_run, signals):
@@ -328,3 +366,12 @@ def test_listener_pids_exit_codes(monkeypatch, returncode, stdout, stderr, expec
 
     monkeypatch.setattr(subprocess, "run", run)
     assert scanner._port_listener_pids(3000) == expected
+
+
+def test_no_sigkill_when_the_port_cannot_be_checked(monkeypatch, signals):
+    # The first check sees the process; after SIGTERM lsof keeps failing.
+    # Without proof that it still holds the port, never escalate.
+    _listeners(monkeypatch, lambda: None if signals else {41000})
+    result = scanner.free_port(_node())
+    assert signals == [(41000, signal.SIGTERM)]
+    assert not result.ok

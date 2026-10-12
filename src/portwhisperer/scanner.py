@@ -30,6 +30,7 @@ class PortInfo:
     process_tree: list = field(default_factory=list)
     ppid: int | None = None
     container: str | None = None  # Docker container name for container ports
+    container_id: str | None = None  # full ID; kills target this, not the name
 
 
 @dataclass
@@ -170,7 +171,7 @@ def _batch_docker_info() -> dict[int, dict]:
     Returns
     -------
     dict[int, dict]
-        Mapping of host port → {name, image}.
+        Mapping of host port → {id, name, image}. ``id`` is the full ID.
 
     Examples
     --------
@@ -183,28 +184,35 @@ def _batch_docker_info() -> dict[int, dict]:
     ambiguous: set[int] = set()
     try:
         proc = subprocess.run(
-            ["docker", "ps", "--format", "{{.Ports}}\\t{{.Names}}\\t{{.Image}}"],
+            [
+                "docker",
+                "ps",
+                "--no-trunc",
+                "--format",
+                "{{.ID}}\\t{{.Ports}}\\t{{.Names}}\\t{{.Image}}",
+            ],
             capture_output=True,
             text=True,
             timeout=5,
         )
-        for line in proc.stdout.strip().splitlines():
+        for line in proc.stdout.splitlines():
             if not line.strip():
                 continue
             parts = line.split("\t")
-            if len(parts) < 2:
+            if len(parts) < 3:
                 continue
-            ports_str, name = parts[0], parts[1]
-            image = parts[2] if len(parts) > 2 else ""
+            container_id, ports_str, name = parts[0], parts[1], parts[2]
+            image = parts[3] if len(parts) > 3 else ""
 
-            # Parse port mappings like "0.0.0.0:5432->5432/tcp, [::]:5432->5432/tcp"
-            # and skip UDP ones, which never show up as TCP listeners
-            pattern = r"(?:\d+\.\d+\.\d+\.\d+|::):(\d+)->\d+/tcp"
+            # Parse mappings like "0.0.0.0:5432->5432/tcp, [::]:5432->5432/tcp"
+            # (older Docker writes ":::5432"). Skip UDP, which never shows up
+            # as a TCP listener.
+            pattern = r"(?:\d+\.\d+\.\d+\.\d+|\[[0-9a-fA-F:.]*\]|::):(\d+)->\d+/tcp"
             for m in re.finditer(pattern, ports_str):
                 port = int(m.group(1))
-                if port in result and result[port]["name"] != name:
+                if port in result and result[port]["id"] != container_id:
                     ambiguous.add(port)
-                result[port] = {"name": name, "image": image}
+                result[port] = {"id": container_id, "name": name, "image": image}
     except (
         subprocess.TimeoutExpired,
         subprocess.CalledProcessError,
@@ -988,6 +996,7 @@ def get_listening_ports() -> list[PortInfo]:
         if docker:
             info.project_name = docker["name"]
             info.container = docker["name"]
+            info.container_id = docker["id"]
             info.framework = _detect_framework_from_image(docker["image"])
             info.process_name = "docker"
 
@@ -1385,7 +1394,7 @@ def _stop_container(info: PortInfo, force: bool) -> KillResult:
     Parameters
     ----------
     info : PortInfo
-        A port whose ``container`` is set.
+        A port whose ``container`` and ``container_id`` are set.
     force : bool
         Use ``docker kill`` instead of ``docker stop``.
 
@@ -1398,7 +1407,7 @@ def _stop_container(info: PortInfo, force: bool) -> KillResult:
     --------
     .. code-block:: python
 
-        _stop_container(info, force=False)  # runs "docker stop <name>"
+        _stop_container(info, force=False)  # runs "docker stop <id>"
     """
     action = "kill" if force else "stop"
     name = info.container or ""
@@ -1408,8 +1417,9 @@ def _stop_container(info: PortInfo, force: bool) -> KillResult:
     before = _port_listener_pids(info.port)
     if before is None or info.pid not in before:
         return _port_free_result(info, before)
+    # Compare full IDs: a recreated container can reuse the old name
     current = _batch_docker_info().get(info.port)
-    if current is None or current["name"] != name:
+    if current is None or current["id"] != info.container_id:
         now = f"now {current['name']}" if current else "now unknown"
         return KillResult(
             info.port,
@@ -1418,11 +1428,12 @@ def _stop_container(info: PortInfo, force: bool) -> KillResult:
             f"the container on :{info.port} changed since it was listed "
             f"(was {name}, {now}). Nothing was stopped; run the command again",
         )
+    container_id = current["id"]
 
     try:
         # docker stop waits up to 10 s for the container before it kills it
         proc = subprocess.run(
-            ["docker", action, name],
+            ["docker", action, container_id],
             capture_output=True,
             text=True,
             timeout=30,
@@ -1503,7 +1514,14 @@ def free_port(info: PortInfo, force: bool = False) -> KillResult:
         return _port_free_result(info, before)
 
     steps = [signal.SIGKILL] if force else [signal.SIGTERM, signal.SIGKILL]
-    for sig in steps:
+    for i, sig in enumerate(steps):
+        if i > 0:
+            # Escalate only on fresh proof that the process still holds the
+            # port. A failed check is not proof, and SIGKILL could cut short a
+            # clean shutdown.
+            current = _port_listener_pids(info.port)
+            if current is None or info.pid not in current:
+                break
         try:
             os.kill(info.pid, sig)
         except ProcessLookupError:
