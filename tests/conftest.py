@@ -11,14 +11,20 @@ from portwhisperer import scanner
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
-# Most specific match first: "lsof -a -d cwd" must not hit the LISTEN route.
+# Most specific match first: "lsof -a -d cwd" and "lsof -w -t" must not hit the
+# LISTEN route.
 ROUTES: list[tuple[str, str]] = [
+    ("lsof -w -t", "lsof_pids.txt"),
     ("-sTCP:LISTEN", "lsof_listen.txt"),
     ("-d cwd", "lsof_cwd.txt"),
     ("ps -p", "ps_batch.txt"),
     ("pid=,ppid=,comm=", "ps_tree.txt"),
     ("pcpu=", "ps_all.txt"),
+    ("docker context inspect", "docker_context.txt"),
     ("docker ps", "docker_ps.txt"),
+    ("docker stop", "docker_stop.txt"),
+    ("docker kill", "docker_stop.txt"),
+    ("launchctl list", "launchctl_list.txt"),
 ]
 
 # The frozen "now" used for uptime assertions.
@@ -93,6 +99,9 @@ def fake_run(monkeypatch: pytest.MonkeyPatch, project_root: Path) -> FakeRun:
     """Replace ``subprocess.run`` with a :class:`FakeRun` serving the fixtures."""
     fake = FakeRun(project_root)
     monkeypatch.setattr(subprocess, "run", fake)
+    # Tests must not depend on the developer's Docker endpoint
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    monkeypatch.delenv("DOCKER_CONTEXT", raising=False)
     return fake
 
 

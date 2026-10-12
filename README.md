@@ -29,7 +29,7 @@ $ ports
   5 ports active  |  Run ports <number> for details  |  --all to show everything
 ```
 
-Colors: green = healthy, yellow = orphaned, red = zombie.
+Colors: green = healthy, blue = detached (its parent shell is gone, which is often on purpose), red = zombie.
 
 ## Install
 
@@ -77,7 +77,7 @@ ports 3000
 ports --whoisonport 3000
 ```
 
-Detailed view: full process tree, repository path, current git branch, memory usage, and an interactive prompt to kill the process.
+Detailed view: full process tree, repository path, current git branch, memory usage, and an interactive prompt to kill the process. The prompt appears only when stdin is a terminal, so scripts never hang on it.
 
 ```
 $ ports 3000
@@ -110,6 +110,8 @@ $ ports 3000
     +-- npm (42860)
       +-- zsh (42501)
 
+  Kill this process: ports kill 3000
+
   Kill process on :3000? [y/N]
 ```
 
@@ -139,13 +141,31 @@ $ ports ps
 ports ps --all    # show all processes, not just dev
 ```
 
-### Clean up orphaned processes
+### Free a port
+
+```bash
+ports kill 3000           # asks once, then frees the port
+ports kill 3000 8080 -y   # several ports, no confirmation
+ports kill 3000 --force   # SIGKILL right away
+```
+
+Sends SIGTERM, waits up to 3 seconds for the port to free up, then sends SIGKILL. It reports success only when nothing listens on the port any more, and exits non-zero otherwise.
+
+- **Docker ports** run `docker stop <container>` (`docker kill` with `--force`). Docker Desktop and your other containers keep running.
+- **Zombies** have already exited, so no signal can remove them. `ports kill` names the parent process that must reap them.
+- **Restarting servers**: if a watcher such as nodemon starts the server again under a new PID, `ports kill` says so and fails.
+
+Without a terminal, `ports kill` needs `--yes`.
+
+### Clean up detached and zombie processes
 
 ```bash
 ports clean
 ```
 
-Finds and kills orphaned or zombie dev server processes. Only targets dev runtimes (node, python, etc.) -- won't touch your desktop apps.
+Lists zombie and detached dev server processes, numbered, and asks which to kill (`1,3`, `all`, or `none`, the default). Only targets dev runtimes (node, python, etc.) -- won't touch your desktop apps.
+
+Intentional daemons are left out: processes started with `--daemon` and jobs managed by launchd, such as `brew services`.
 
 ### Watch for port changes
 

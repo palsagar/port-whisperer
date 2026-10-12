@@ -24,10 +24,13 @@ class PortInfo:
     framework: str | None = None
     uptime: str | None = None
     start_time: datetime | None = None
-    status: str = "healthy"  # "healthy" | "orphaned" | "zombie"
+    status: str = "healthy"  # "healthy" | "detached" | "zombie"
     memory: str | None = None
     git_branch: str | None = None
     process_tree: list = field(default_factory=list)
+    ppid: int | None = None
+    container: str | None = None  # Docker container name for container ports
+    container_id: str | None = None  # full ID; kills target this, not the name
 
 
 @dataclass
@@ -159,13 +162,22 @@ def _batch_cwd(pids: list[int]) -> dict[int, str]:
     return result
 
 
-def _batch_docker_info() -> dict[int, dict]:
+def _batch_docker_info(env: dict[str, str] | None = None) -> dict[int, dict]:
     """Single docker ps call to get container info keyed by host port.
+
+    Only TCP bindings count. A port that two containers publish is left out,
+    because a kill could not tell which container to stop.
+
+    Parameters
+    ----------
+    env : dict[str, str] | None
+        Environment for the docker call, to pin the endpoint. None inherits
+        the current environment.
 
     Returns
     -------
     dict[int, dict]
-        Mapping of host port → {name, image}.
+        Mapping of host port → {id, name, image}. ``id`` is the full ID.
 
     Examples
     --------
@@ -175,35 +187,47 @@ def _batch_docker_info() -> dict[int, dict]:
         print(docker.get(5432))
     """
     result: dict[int, dict] = {}
+    ambiguous: set[int] = set()
     try:
         proc = subprocess.run(
-            ["docker", "ps", "--format", "{{.Ports}}\\t{{.Names}}\\t{{.Image}}"],
+            [
+                "docker",
+                "ps",
+                "--no-trunc",
+                "--format",
+                "{{.ID}}\\t{{.Ports}}\\t{{.Names}}\\t{{.Image}}",
+            ],
             capture_output=True,
             text=True,
             timeout=5,
+            env=env,
         )
-        for line in proc.stdout.strip().splitlines():
+        for line in proc.stdout.splitlines():
             if not line.strip():
                 continue
             parts = line.split("\t")
-            if len(parts) < 2:
+            if len(parts) < 3:
                 continue
-            ports_str, name = parts[0], parts[1]
-            image = parts[2] if len(parts) > 2 else ""
+            container_id, ports_str, name = parts[0], parts[1], parts[2]
+            image = parts[3] if len(parts) > 3 else ""
 
-            # Parse port mappings like "0.0.0.0:5432->5432/tcp, [::]:5432->5432/tcp"
-            seen: set[int] = set()
-            for m in re.finditer(r"(?:\d+\.\d+\.\d+\.\d+|::):(\d+)->", ports_str):
+            # Parse mappings like "0.0.0.0:5432->5432/tcp, [::]:5432->5432/tcp"
+            # (older Docker writes ":::5432"). Skip UDP, which never shows up
+            # as a TCP listener.
+            pattern = r"(?:\d+\.\d+\.\d+\.\d+|\[[0-9a-fA-F:.]*\]|::):(\d+)->\d+/tcp"
+            for m in re.finditer(pattern, ports_str):
                 port = int(m.group(1))
-                if port not in seen:
-                    seen.add(port)
-                    result[port] = {"name": name, "image": image}
+                if port in result and result[port]["id"] != container_id:
+                    ambiguous.add(port)
+                result[port] = {"id": container_id, "name": name, "image": image}
     except (
         subprocess.TimeoutExpired,
         subprocess.CalledProcessError,
         FileNotFoundError,
     ):
         pass
+    for port in ambiguous:
+        del result[port]
     return result
 
 
@@ -716,7 +740,7 @@ def _decode_lsof_name(name: str) -> str:
 def is_dev_process(name: str, command: str) -> bool:
     """Return True if the process looks like a dev server rather than a system app.
 
-    Used for orphan detection and filtering the table view.
+    Used for detached-process detection and filtering the table view.
 
     Parameters
     ----------
@@ -948,10 +972,13 @@ def get_listening_ports() -> list[PortInfo]:
 
         # Status and uptime from batched ps
         if ps:
+            info.ppid = ps["ppid"]
             if "Z" in ps["stat"]:
                 info.status = "zombie"
+            # Parent PID 1 means the process outlived the shell that started it.
+            # That is a fact, not a fault: nohup jobs and daemons look the same.
             elif ps["ppid"] == 1 and is_dev_process(process_name, ps["command"]):
-                info.status = "orphaned"
+                info.status = "detached"
 
             if ps["rss"] > 0:
                 info.memory = _format_memory(ps["rss"])
@@ -970,9 +997,13 @@ def get_listening_ports() -> list[PortInfo]:
             info.framework = _detect_framework_from_command(ps["command"], process_name)
 
         # Docker container overrides
-        docker = docker_map.get(port)
+        # Only Docker's own listener stands for a container. A native server
+        # that shares the port number must not inherit the container's name.
+        docker = docker_map.get(port) if is_docker_process(process_name) else None
         if docker:
             info.project_name = docker["name"]
+            info.container = docker["name"]
+            info.container_id = docker["id"]
             info.framework = _detect_framework_from_image(docker["image"])
             info.process_name = "docker"
 
@@ -1129,52 +1160,451 @@ def get_port_details(port: int) -> PortInfo | None:
     return None
 
 
-def find_orphaned_processes() -> list[PortInfo]:
-    """Return listening ports whose process status is orphaned or zombie.
+def _launchd_pids() -> set[int]:
+    """Return the PIDs of running jobs that launchd manages for this user.
+
+    ``brew services`` and other launch agents show up here.
+
+    Returns
+    -------
+    set[int]
+        PIDs from the first column of ``launchctl list``; empty on failure.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        if 1234 in _launchd_pids():
+            print("managed by launchd")
+    """
+    try:
+        proc = subprocess.run(
+            ["launchctl", "list"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return set()
+    pids: set[int] = set()
+    for line in proc.stdout.splitlines()[1:]:  # skip header
+        parts = line.split()
+        # Jobs that are loaded but not running show "-" instead of a PID
+        if parts and parts[0].isdigit():
+            pids.add(int(parts[0]))
+    return pids
+
+
+def find_clean_candidates() -> list[PortInfo]:
+    """Return the dev servers that ``ports clean`` may offer to kill.
+
+    These are zombies, plus detached processes that are not intentional
+    daemons. A detached process counts as a daemon, and is left out, when:
+
+    - its command line contains ``--daemon``, or
+    - launchd manages it for this user (its PID is in ``launchctl list``),
+      as with ``brew services``. Jobs started with ``sudo brew services``
+      belong to root's launchd domain and are not detected.
+
+    pm2 needs no rule: its processes are children of the pm2 daemon, not of
+    PID 1, so they are never detached.
 
     Returns
     -------
     list[PortInfo]
-        Ports with status "orphaned" or "zombie".
+        Candidate ports, sorted by port number.
 
     Examples
     --------
     .. code-block:: python
 
-        for p in find_orphaned_processes():
+        for p in find_clean_candidates():
             print(p.port, p.status)
     """
     ports = get_listening_ports()
-    return [p for p in ports if p.status in ("orphaned", "zombie")]
+    # Only pay for the launchctl call when there is a detached process to check
+    launchd = _launchd_pids() if any(p.status == "detached" for p in ports) else set()
+    return [
+        p
+        for p in ports
+        if p.status == "zombie"
+        or (
+            p.status == "detached"
+            and "--daemon" not in p.command
+            and p.pid not in launchd
+        )
+    ]
 
 
-def kill_process(pid: int, sig: int = signal.SIGTERM) -> bool:
-    """Send a signal to a process.
+@dataclass
+class KillResult:
+    port: int
+    pid: int | None  # None when nothing listened on the port to begin with
+    ok: bool  # True only when nothing listens on the port any more
+    detail: str
+
+
+# Seconds to wait for the port after SIGTERM, then after SIGKILL or docker stop
+_TERM_TIMEOUT = 3.0
+_KILL_TIMEOUT = 2.0
+_POLL_INTERVAL = 0.1
+
+
+def is_docker_process(name: str) -> bool:
+    """Return True when the process name belongs to the Docker family.
 
     Parameters
     ----------
-    pid : int
-        Target process ID.
-    sig : int
-        Signal to send (default: SIGTERM).
+    name : str
+        Process name to check.
 
     Returns
     -------
     bool
-        True on success, False if the process was not found or permission denied.
+        True for com.docker.*, Docker*, docker, and docker-sandbox.
 
     Examples
     --------
     .. code-block:: python
 
-        success = kill_process(1234)
-        print(success)  # True
+        is_docker_process("com.docker.backend")  # True
+        is_docker_process("node")                # False
+    """
+    return (
+        name.startswith("com.docke")
+        or name.startswith("Docker")
+        or name in ("docker", "docker-sandbox")
+    )
+
+
+def _port_listener_pids(port: int) -> set[int] | None:
+    """Return the PIDs that listen on a TCP port.
+
+    Parameters
+    ----------
+    port : int
+        The TCP port to check.
+
+    Returns
+    -------
+    set[int] | None
+        The listening PIDs, an empty set when the port is free, or None when
+        ``lsof`` could not run.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        if not _port_listener_pids(3000):
+            print("port 3000 is free")
     """
     try:
-        os.kill(pid, sig)
-        return True
-    except OSError:
-        return False
+        proc = subprocess.run(
+            # -w hides harmless warnings, so anything on stderr is a real error
+            ["lsof", "-w", "-t", f"-iTCP:{port}", "-sTCP:LISTEN", "-P", "-n"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    # lsof exits 1 both for "no match" and for errors; only errors print
+    if proc.returncode == 1 and not proc.stdout.strip() and not proc.stderr.strip():
+        return set()
+    if proc.returncode != 0:
+        return None
+    return {int(pid) for pid in proc.stdout.split() if pid.isdigit()}
+
+
+def _wait_for_release(port: int, pid: int, timeout: float) -> bool:
+    """Poll until ``pid`` no longer listens on ``port`` or ``timeout`` passes.
+
+    Parameters
+    ----------
+    port : int
+        The TCP port to watch.
+    pid : int
+        The process expected to let go of the port.
+    timeout : float
+        Seconds to wait.
+
+    Returns
+    -------
+    bool
+        True if the process let go of the port in time.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        _wait_for_release(3000, 41000, timeout=3.0)
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        listeners = _port_listener_pids(port)
+        if listeners is not None and pid not in listeners:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_POLL_INTERVAL)
+
+
+def _port_free_result(info: PortInfo, before: set[int] | None = None) -> KillResult:
+    """Build the final result from one last look at the port.
+
+    Parameters
+    ----------
+    info : PortInfo
+        The port that was targeted.
+    before : set[int] | None
+        PIDs that listened on the port before the kill, if known.
+
+    Returns
+    -------
+    KillResult
+        Success only when nothing listens on the port.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        result = _port_free_result(info)
+    """
+    listeners = _port_listener_pids(info.port)
+
+    def fail(detail: str) -> KillResult:
+        return KillResult(info.port, info.pid, False, detail)
+
+    if listeners is None:
+        return fail(f"could not check whether :{info.port} is free (lsof failed)")
+    if not listeners:
+        return KillResult(info.port, info.pid, True, "port is free")
+    if info.pid in listeners:
+        return fail(f"PID {info.pid} still listens on :{info.port}")
+    others = ", ".join(str(p) for p in sorted(listeners))
+    if before and listeners <= before:
+        # Prefork servers share one socket across several PIDs
+        return fail(
+            f"PID {others} also listened on :{info.port} and is still running. "
+            f"Run ports kill {info.port} again to stop it"
+        )
+    # The old process is gone but something restarted the server
+    return fail(
+        f"PID {info.pid} stopped, but PID {others} took :{info.port} again. "
+        "A parent watcher (nodemon, npm run dev) probably restarted it"
+    )
+
+
+def _local_docker_env() -> dict[str, str] | None:
+    """Return an environment pinned to the Docker endpoint, if it is local.
+
+    The endpoint comes from ``DOCKER_HOST`` or else the active docker context.
+    Only a ``unix://`` socket is local. A remote daemon's containers can
+    publish the same port numbers as local listeners, so stopping one of them
+    would hit the wrong machine.
+
+    Returns
+    -------
+    dict[str, str] | None
+        A copy of the environment with ``DOCKER_HOST`` set to the local socket
+        and ``DOCKER_CONTEXT`` removed, or None when the endpoint is not local
+        or cannot be found.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        env = _local_docker_env()
+        if env:
+            subprocess.run(["docker", "ps"], env=env)
+    """
+    host = os.environ.get("DOCKER_HOST")
+    if not host:
+        try:
+            proc = subprocess.run(
+                [
+                    "docker",
+                    "context",
+                    "inspect",
+                    "--format",
+                    "{{.Endpoints.docker.Host}}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return None
+        if proc.returncode != 0:
+            return None
+        host = proc.stdout.strip()
+    if not host.startswith("unix://"):
+        return None
+    env = {k: v for k, v in os.environ.items() if k != "DOCKER_CONTEXT"}
+    env["DOCKER_HOST"] = host
+    return env
+
+
+def _stop_container(info: PortInfo, force: bool) -> KillResult:
+    """Stop the Docker container behind a port, then check that the port is free.
+
+    Parameters
+    ----------
+    info : PortInfo
+        A port whose ``container`` and ``container_id`` are set.
+    force : bool
+        Use ``docker kill`` instead of ``docker stop``.
+
+    Returns
+    -------
+    KillResult
+        The outcome for the port.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        _stop_container(info, force=False)  # runs "docker stop <id>"
+    """
+    action = "kill" if force else "stop"
+    name = info.container or ""
+
+    # Re-check right before stopping: the port may be free already, or a
+    # different container may have taken it since the user confirmed
+    before = _port_listener_pids(info.port)
+    if before is None or info.pid not in before:
+        return _port_free_result(info, before)
+    env = _local_docker_env()
+    if env is None:
+        return KillResult(
+            info.port,
+            info.pid,
+            False,
+            "Docker is not using a local socket (check DOCKER_HOST and "
+            "docker context), so the container behind this port cannot be "
+            "confirmed. Nothing was stopped",
+        )
+    # Compare full IDs: a recreated container can reuse the old name
+    current = _batch_docker_info(env).get(info.port)
+    if current is None or current["id"] != info.container_id:
+        now = f"now {current['name']}" if current else "now unknown"
+        return KillResult(
+            info.port,
+            info.pid,
+            False,
+            f"the container on :{info.port} changed since it was listed "
+            f"(was {name}, {now}). Nothing was stopped; run the command again",
+        )
+    container_id = current["id"]
+
+    try:
+        # docker stop waits up to 10 s for the container before it kills it
+        proc = subprocess.run(
+            ["docker", action, container_id],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+    except FileNotFoundError:
+        return KillResult(info.port, info.pid, False, "the docker CLI is not found")
+    except subprocess.TimeoutExpired:
+        return KillResult(
+            info.port, info.pid, False, f"docker {action} {name} timed out"
+        )
+    if proc.returncode != 0:
+        # Drop control characters so docker's output cannot drive the terminal
+        error = re.sub(r"[\x00-\x1f\x7f]", "", proc.stderr.strip())
+        error = error or f"exit code {proc.returncode}"
+        return KillResult(
+            info.port, info.pid, False, f"docker {action} {name} failed: {error}"
+        )
+
+    _wait_for_release(info.port, info.pid, _KILL_TIMEOUT)
+    return _port_free_result(info)
+
+
+def free_port(info: PortInfo, force: bool = False) -> KillResult:
+    """Stop whatever listens on a port and report success only once it is free.
+
+    - A Docker container port runs ``docker stop`` (or ``docker kill`` with
+      ``force``). Docker's own processes never receive a signal, because that
+      would stop every container.
+    - A zombie has already exited, so it gets no signal. Only its parent can
+      remove it.
+    - Any other process gets SIGTERM, then SIGKILL if it still holds the port
+      after ``_TERM_TIMEOUT`` seconds. ``force`` sends SIGKILL at once.
+
+    Parameters
+    ----------
+    info : PortInfo
+        The port to free, from :func:`get_listening_ports`.
+    force : bool
+        Skip the graceful step.
+
+    Returns
+    -------
+    KillResult
+        ``ok`` is True only if nothing listens on the port afterwards.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        result = free_port(get_port_details(3000))
+        print(result.ok, result.detail)
+    """
+    if info.status == "zombie":
+        parent = f"PID {info.ppid}" if info.ppid else "its parent"
+        return KillResult(
+            info.port,
+            info.pid,
+            False,
+            f"PID {info.pid} is a zombie: it has already exited and no signal "
+            f"can remove it. Only its parent ({parent}) can reap it",
+        )
+    if info.container:
+        return _stop_container(info, force)
+    if is_docker_process(info.raw_name):
+        return KillResult(
+            info.port,
+            info.pid,
+            False,
+            f"PID {info.pid} is Docker's own process; signalling it would stop "
+            "every container. No container was found for this port (is the "
+            "docker CLI installed?)",
+        )
+
+    # Signal only a PID that still holds the port. After a long prompt the
+    # server may be gone and its PID reused by an unrelated process.
+    before = _port_listener_pids(info.port)
+    if before is None or info.pid not in before:
+        return _port_free_result(info, before)
+
+    steps = [signal.SIGKILL] if force else [signal.SIGTERM, signal.SIGKILL]
+    for i, sig in enumerate(steps):
+        if i > 0:
+            # Escalate only on fresh proof that the process still holds the
+            # port. A failed check is not proof, and SIGKILL could cut short a
+            # clean shutdown.
+            current = _port_listener_pids(info.port)
+            if current is None or info.pid not in current:
+                break
+        try:
+            os.kill(info.pid, sig)
+        except ProcessLookupError:
+            break  # already gone; the final check decides
+        except PermissionError:
+            return KillResult(
+                info.port,
+                info.pid,
+                False,
+                f"permission denied. Try: sudo kill {info.pid}",
+            )
+        timeout = _TERM_TIMEOUT if sig == signal.SIGTERM else _KILL_TIMEOUT
+        if _wait_for_release(info.port, info.pid, timeout):
+            break
+    return _port_free_result(info, before)
 
 
 def watch_ports(callback: Callable, interval: float = 2.0) -> None:

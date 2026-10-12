@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import re
+import sys
 
 import click
 from rich.console import Console
 
 from portwhisperer.display import (
-    display_clean_results,
+    display_clean_candidates,
+    display_kill_results,
+    display_kill_targets,
     display_port_detail,
     display_port_table,
     display_process_table,
@@ -14,13 +17,15 @@ from portwhisperer.display import (
     display_watch_header,
 )
 from portwhisperer.scanner import (
+    KillResult,
     ProcessInfo,
-    find_orphaned_processes,
+    find_clean_candidates,
+    free_port,
     get_all_processes,
     get_listening_ports,
     get_port_details,
     is_dev_process,
-    kill_process,
+    is_docker_process,
     watch_ports,
 )
 
@@ -45,31 +50,17 @@ class _PortGroup(click.Group):
         return super().parse_args(ctx, args)
 
 
-def _is_docker_process(name: str) -> bool:
-    """Return True when the process name belongs to the Docker family.
-
-    Parameters
-    ----------
-    name : str
-        Process name to check.
-
-    Returns
-    -------
-    bool
-        True for com.docker.*, Docker*, docker, and docker-sandbox.
+def _stdin_is_tty() -> bool:
+    """Return True when a person can answer prompts on stdin.
 
     Examples
     --------
     .. code-block:: python
 
-        _is_docker_process("com.docker.backend")  # True
-        _is_docker_process("node")                # False
+        if _stdin_is_tty():
+            click.confirm("Kill?")
     """
-    return (
-        name.startswith("com.docke")
-        or name.startswith("Docker")
-        or name in ("docker", "docker-sandbox")
-    )
+    return sys.stdin.isatty()
 
 
 def _parse_memory_to_kb(memory: str | None) -> float:
@@ -160,8 +151,8 @@ def _collapse_docker(processes: list[ProcessInfo]) -> list[ProcessInfo]:
 
         collapsed = _collapse_docker(dev_processes)
     """
-    docker_procs = [p for p in processes if _is_docker_process(p.process_name)]
-    non_docker = [p for p in processes if not _is_docker_process(p.process_name)]
+    docker_procs = [p for p in processes if is_docker_process(p.process_name)]
+    non_docker = [p for p in processes if not is_docker_process(p.process_name)]
 
     if not docker_procs:
         return non_docker
@@ -200,12 +191,13 @@ def main(ctx: click.Context, show_all: bool, whoisonport: int | None) -> None:
     if whoisonport is not None:
         info = get_port_details(whoisonport)
         display_port_detail(info)
-        if info and click.confirm(f"  Kill process on :{whoisonport}?", default=False):
-            success = kill_process(info.pid)
-            if success:
-                console.print(f"\n  [green]✓ Killed PID {info.pid}[/]\n")
-            else:
-                console.print(f"\n  [red]✕ Failed. Try: sudo kill -9 {info.pid}[/]\n")
+        # Without a terminal nobody can answer, so never prompt (or hang)
+        if (
+            info
+            and _stdin_is_tty()
+            and click.confirm(f"  Kill process on :{whoisonport}?", default=False)
+        ):
+            display_kill_results([free_port(info)])
         return
 
     # Default: show port table, filtered to dev servers unless --all
@@ -237,39 +229,108 @@ def ps(show_all: bool) -> None:
     display_process_table(processes, filtered=not show_all)
 
 
+def _parse_selection(raw: str, count: int) -> list[int]:
+    """Turn the answer to "Kill which?" into zero-based candidate indexes.
+
+    Parameters
+    ----------
+    raw : str
+        The answer: ``all``, ``none`` or empty, or numbers separated by commas
+        or spaces.
+    count : int
+        Number of candidates on offer.
+
+    Returns
+    -------
+    list[int]
+        Picked indexes in the order given, without duplicates.
+
+    Raises
+    ------
+    click.BadParameter
+        When a number is out of range or the answer cannot be read. Click then
+        asks again.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        _parse_selection("1,3", 3)  # [0, 2]
+        _parse_selection("all", 2)  # [0, 1]
+    """
+    answer = raw.strip().lower()
+    if answer in ("", "none"):
+        return []
+    if answer == "all":
+        return list(range(count))
+    picked: list[int] = []
+    for token in answer.replace(",", " ").split():
+        if not token.isdigit() or not 1 <= int(token) <= count:
+            raise click.BadParameter(
+                f"{token!r} is not a number from 1 to {count}, 'all' or 'none'"
+            )
+        if int(token) - 1 not in picked:
+            picked.append(int(token) - 1)
+    if not picked:
+        raise click.BadParameter("give numbers like 1,3, or 'all' or 'none'")
+    return picked
+
+
 @main.command()
 def clean() -> None:
-    """Kill orphaned and zombie dev server processes."""
-    orphaned = find_orphaned_processes()
-
-    if not orphaned:
-        display_clean_results(orphaned, killed=[], failed=[])
+    """Pick detached or zombie dev servers to kill. Daemons are left alone."""
+    candidates = find_clean_candidates()
+    display_clean_candidates(candidates)
+    if not candidates:
         return
 
-    # List what will be killed before asking for confirmation
-    console.print()
-    count = len(orphaned)
-    noun = "process" if count == 1 else "processes"
-    console.print(f"[bold yellow]  Found {count} orphaned/zombie {noun}:[/]\n")
-    for p in orphaned:
+    if not _stdin_is_tty():
         console.print(
-            f"  [dim]•[/] :[bold white]{p.port}[/] [dim]—[/] "
-            f"{p.process_name} [dim](PID {p.pid})[/]"
+            "[dim]  No terminal, so nothing was killed. "
+            "Use [/][cyan]ports kill <port> --yes[/][dim].[/]\n"
         )
-    console.print()
+        return
 
-    killed: list[int] = []
-    failed: list[int] = []
+    picked = click.prompt(
+        "  Kill which? (e.g. 1,3 / all / none)",
+        default="none",
+        show_default=False,
+        value_proc=lambda raw: _parse_selection(raw, len(candidates)),
+    )
+    if not picked:
+        console.print("[dim]\n  Nothing killed.\n[/]")
+        return
+    display_kill_results([free_port(candidates[i]) for i in picked])
 
-    if click.confirm("  Kill all?", default=False):
-        for p in orphaned:
-            if kill_process(p.pid):
-                killed.append(p.pid)
-            else:
-                failed.append(p.pid)
-        display_clean_results(orphaned, killed=killed, failed=failed)
-    else:
-        console.print("[dim]\n  Aborted.\n[/]")
+
+@main.command()
+@click.argument("port_numbers", metavar="PORT...", nargs=-1, required=True, type=int)
+@click.option("--force", is_flag=True, help="Send SIGKILL (or docker kill) right away")
+@click.option("--yes", "-y", is_flag=True, help="Do not ask for confirmation")
+def kill(port_numbers: tuple[int, ...], force: bool, yes: bool) -> None:
+    """Free the given ports and exit 0 only if all of them end up free."""
+    by_port = {p.port: p for p in get_listening_ports()}
+    requested = list(dict.fromkeys(port_numbers))
+    targets = [by_port[n] for n in requested if n in by_port]
+
+    if targets and not yes:
+        if not _stdin_is_tty():
+            console.print("[red]  stdin is not a terminal. Pass --yes to kill.[/]")
+            sys.exit(1)
+        display_kill_targets(targets)
+        noun = "this" if len(targets) == 1 else f"these {len(targets)}"
+        if not click.confirm(f"  Kill {noun}?", default=False):
+            console.print("[dim]\n  Aborted.\n[/]")
+            sys.exit(1)
+
+    results = {t.port: free_port(t, force=force) for t in targets}
+    ordered = [
+        results.get(n) or KillResult(n, None, False, f"nothing listens on :{n}")
+        for n in requested
+    ]
+    display_kill_results(ordered)
+    if not all(r.ok for r in ordered):
+        sys.exit(1)
 
 
 @main.command()
