@@ -178,6 +178,20 @@ def test_port_details(fake_run, frozen_now):
     assert info.process_tree[1]["name"] == "/opt/homebrew/bin/uv"
 
 
+def test_port_details_looks_up_only_the_target(fake_run, frozen_now):
+    # One git call and one process-table scan, however many ports are listening
+    scanner.get_port_details(8012)
+    assert len(fake_run.commands("git")) == 1
+    assert len(fake_run.commands("pid=,ppid=,comm=")) == 1
+
+
+def test_port_details_docker_skips_git(fake_run, frozen_now):
+    info = scanner.get_port_details(5432)
+    assert info is not None
+    assert info.git_branch is None
+    assert fake_run.commands("git") == []
+
+
 def test_port_details_missing_port(fake_run, frozen_now):
     assert scanner.get_port_details(9999) is None
 

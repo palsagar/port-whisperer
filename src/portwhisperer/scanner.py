@@ -623,6 +623,38 @@ def _get_process_tree(pid: int) -> list[dict]:
     return tree
 
 
+def _get_git_branch(directory: str) -> str | None:
+    """Return the current git branch of ``directory``, or None.
+
+    Parameters
+    ----------
+    directory : str
+        Directory inside a git work tree.
+
+    Returns
+    -------
+    str | None
+        Branch name, or None when the directory is not a git repository.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        print(_get_git_branch("/home/user/myapp"))  # "main"
+    """
+    try:
+        git_proc = subprocess.run(
+            f'git -C "{directory}" rev-parse --abbrev-ref HEAD',
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        return git_proc.stdout.strip() or None
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+        return None
+
+
 def _decode_lsof_name(name: str) -> str:
     """Decode the ``\\xNN`` escapes that lsof writes into the COMMAND column.
 
@@ -799,16 +831,12 @@ def is_dev_process(name: str, command: str) -> bool:
     return any(pattern.search(cmd) for pattern in cmd_indicators)
 
 
-def get_listening_ports(detailed: bool = False) -> list[PortInfo]:
+def get_listening_ports() -> list[PortInfo]:
     """Return all TCP ports in LISTEN state with process and project metadata.
 
     Uses a single ``lsof`` call and batches all follow-up lookups to avoid
-    N×6 individual shell calls.
-
-    Parameters
-    ----------
-    detailed : bool
-        When True, also fetch git branch and process tree for each port.
+    N×6 individual shell calls. Git branch and process tree are left empty;
+    :func:`get_port_details` fills them for one port.
 
     Returns
     -------
@@ -928,24 +956,6 @@ def get_listening_ports(detailed: bool = False) -> list[PortInfo]:
             info.cwd = project_root
             info.project_name = os.path.basename(project_root)
             info.framework = info.framework or _detect_framework(project_root)
-
-            if detailed:
-                try:
-                    git_proc = subprocess.run(
-                        f'git -C "{info.cwd}" rev-parse --abbrev-ref HEAD',
-                        shell=True,
-                        capture_output=True,
-                        text=True,
-                        timeout=3,
-                    )
-                    branch = git_proc.stdout.strip()
-                    if branch:
-                        info.git_branch = branch
-                except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
-                    pass
-
-        if detailed:
-            info.process_tree = _get_process_tree(pid)
 
         results.append(info)
 
@@ -1080,10 +1090,13 @@ def get_port_details(port: int) -> PortInfo | None:
         if details:
             print(details.framework, details.git_branch)
     """
-    ports = get_listening_ports(detailed=True)
-    for p in ports:
-        if p.port == port:
-            return p
+    for info in get_listening_ports():
+        if info.port == port:
+            # Only the requested port pays for the git and process tree lookups
+            if info.cwd:
+                info.git_branch = _get_git_branch(info.cwd)
+            info.process_tree = _get_process_tree(info.pid)
+            return info
     return None
 
 
