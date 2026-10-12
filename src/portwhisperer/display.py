@@ -136,7 +136,7 @@ def format_status(status: str) -> str:
     Parameters
     ----------
     status : str
-        One of "healthy", "orphaned", "zombie", or any other value.
+        One of "healthy", "detached", "zombie", or any other value.
 
     Returns
     -------
@@ -151,7 +151,7 @@ def format_status(status: str) -> str:
     """
     _map = {
         "healthy": ("[green]●[/]", "[green]healthy[/]"),
-        "orphaned": ("[yellow]●[/]", "[yellow]orphaned[/]"),
+        "detached": ("[blue]●[/]", "[blue]detached[/]"),
         "zombie": ("[red]●[/]", "[red]zombie[/]"),
     }
     icon, label = _map.get(status, ("[dim]●[/]", f"[dim]{status}[/]"))

@@ -81,8 +81,8 @@ def test_command_comes_from_ps(ports):
 
 def test_status(ports):
     assert ports[8012].status == "healthy"
-    # ppid 1 and a dev runtime → orphaned
-    assert ports[37777].status == "orphaned"
+    # ppid 1 and a dev runtime → detached (no parent shell)
+    assert ports[37777].status == "detached"
     # ppid 1 but not a dev process → still healthy
     assert ports[54361].status == "healthy"
     assert ports[62813].status == "healthy"

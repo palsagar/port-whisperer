@@ -24,7 +24,7 @@ class PortInfo:
     framework: str | None = None
     uptime: str | None = None
     start_time: datetime | None = None
-    status: str = "healthy"  # "healthy" | "orphaned" | "zombie"
+    status: str = "healthy"  # "healthy" | "detached" | "zombie"
     memory: str | None = None
     git_branch: str | None = None
     process_tree: list = field(default_factory=list)
@@ -718,7 +718,7 @@ def _decode_lsof_name(name: str) -> str:
 def is_dev_process(name: str, command: str) -> bool:
     """Return True if the process looks like a dev server rather than a system app.
 
-    Used for orphan detection and filtering the table view.
+    Used for detached-process detection and filtering the table view.
 
     Parameters
     ----------
@@ -953,8 +953,10 @@ def get_listening_ports() -> list[PortInfo]:
             info.ppid = ps["ppid"]
             if "Z" in ps["stat"]:
                 info.status = "zombie"
+            # Parent PID 1 means the process outlived the shell that started it.
+            # That is a fact, not a fault: nohup jobs and daemons look the same.
             elif ps["ppid"] == 1 and is_dev_process(process_name, ps["command"]):
-                info.status = "orphaned"
+                info.status = "detached"
 
             if ps["rss"] > 0:
                 info.memory = _format_memory(ps["rss"])
@@ -1134,12 +1136,12 @@ def get_port_details(port: int) -> PortInfo | None:
 
 
 def find_orphaned_processes() -> list[PortInfo]:
-    """Return listening ports whose process status is orphaned or zombie.
+    """Return listening ports whose process status is detached or zombie.
 
     Returns
     -------
     list[PortInfo]
-        Ports with status "orphaned" or "zombie".
+        Ports with status "detached" or "zombie".
 
     Examples
     --------
@@ -1149,7 +1151,7 @@ def find_orphaned_processes() -> list[PortInfo]:
             print(p.port, p.status)
     """
     ports = get_listening_ports()
-    return [p for p in ports if p.status in ("orphaned", "zombie")]
+    return [p for p in ports if p.status in ("detached", "zombie")]
 
 
 @dataclass
