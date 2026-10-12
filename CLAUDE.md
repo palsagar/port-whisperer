@@ -25,9 +25,9 @@ No build step. Tests live in `tests/`. They monkeypatch `subprocess.run` to serv
 
 Three source files:
 
-- `src/portwhisperer/cli.py` — CLI entrypoint and command router. Defines the `main` Click group and subcommands (`ps`, `clean`, `watch`). Handles interactive kill prompts and Docker process collapsing for `ps`.
-- `src/portwhisperer/scanner.py` — All data gathering. Shells out to `lsof`, `ps`, and `docker ps`. Exposes `PortInfo` and `ProcessInfo` dataclasses. Public functions: `get_listening_ports`, `get_all_processes`, `get_port_details`, `find_orphaned_processes`, `kill_process`, `watch_ports`, `is_dev_process`.
-- `src/portwhisperer/display.py` — All terminal output. Uses rich tables, panels, and trees. Pure rendering — takes data, prints it. Public functions: `display_port_table`, `display_process_table`, `display_port_detail`, `display_clean_results`, `display_watch_event`, `display_watch_header`.
+- `src/portwhisperer/cli.py` — CLI entrypoint and command router. Defines the `main` Click group and subcommands (`ps`, `kill`, `clean`, `watch`). Handles interactive kill prompts (skipped when stdin is not a TTY) and Docker process collapsing for `ps`.
+- `src/portwhisperer/scanner.py` — All data gathering. Shells out to `lsof`, `ps`, and `docker ps`. Exposes `PortInfo`, `ProcessInfo` and `KillResult` dataclasses. Public functions: `get_listening_ports`, `get_all_processes`, `get_port_details`, `find_clean_candidates`, `free_port`, `watch_ports`, `is_dev_process`, `is_docker_process`.
+- `src/portwhisperer/display.py` — All terminal output. Uses rich tables, panels, and trees. Pure rendering — takes data, prints it. Public functions: `display_port_table`, `display_process_table`, `display_port_detail`, `display_clean_candidates`, `display_kill_targets`, `display_kill_results`, `display_watch_event`, `display_watch_header`.
 
 Data flow: cli calls scanner functions → gets `PortInfo` / `ProcessInfo` dataclasses → passes to display functions.
 
@@ -38,3 +38,5 @@ Data flow: cli calls scanner functions → gets `PortInfo` / `ProcessInfo` datac
 - **Framework detection cascade**: `_detect_framework_from_command` → `_detect_framework` (inspects `package.json` deps and config files in cwd) → `_detect_framework_from_image` (for Docker) → `_detect_framework_from_name` (process name fallback).
 - **Custom Click group**: `_PortGroup` rewrites a leading integer argument (e.g. `ports 3000`) to `--whoisonport 3000` before Click parses it, so bare port numbers coexist with named subcommands.
 - **Docker collapsing**: The `ps` subcommand merges all `com.docker.*` / `Docker*` processes into a single summary row with summed CPU and memory, to avoid noise.
+- **Safe killing**: every kill goes through `free_port`. It reports success only when `lsof` shows nothing listening on the port. Docker ports use `docker stop <container>` and never signal Docker's own processes. Zombies get no signal.
+- **Detached vs daemon**: status `detached` means parent PID 1 (a fact, not a warning). `clean` skips detached processes started with `--daemon` or managed by launchd (`launchctl list`).
