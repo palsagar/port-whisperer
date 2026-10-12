@@ -418,3 +418,130 @@ def test_docker_calls_are_pinned_to_the_local_endpoint(monkeypatch, fake_run, si
         "ps": "unix:///var/run/docker.sock",
         "stop": "unix:///var/run/docker.sock",
     }
+
+
+# ── other container engines (#12) ─────────────────────────────────────────────
+
+COLIMA_SOCK = "unix:///Users/dev/.colima/default/docker.sock"
+COLIMA_SSH = "ssh -F /Users/dev/.colima/_lima/colima/ssh.config -L 5432:x lima-colima"
+
+
+@pytest.mark.parametrize(
+    ("name", "command", "engine"),
+    [
+        ("com.docker.backend", "", "Docker"),
+        ("Docker Desktop", "", "Docker"),
+        ("docker-sandbox", "", "Docker"),
+        ("vpnkit-bridge", "", "Docker"),
+        ("OrbStack Helper", "", "OrbStack"),
+        ("limactl", "limactl hostagent colima", "Lima"),
+        ("ssh", COLIMA_SSH, "Lima"),
+        ("Rancher Desktop", "", "Rancher Desktop"),
+        ("gvproxy", "", "Podman"),
+        # An ordinary ssh tunnel is the user's own and may be killed
+        ("ssh", "ssh -L 5432:db:5432 bastion", None),
+        ("node", "node server.js", None),
+    ],
+)
+def test_container_engine(name, command, engine):
+    assert scanner.container_engine(name, command) == engine
+
+
+@pytest.mark.parametrize(
+    ("raw_name", "command"),
+    [("OrbStack Helper", ""), ("limactl", "limactl hostagent"), ("ssh", COLIMA_SSH)],
+)
+def test_engine_forwarder_without_container_gets_no_signal(
+    monkeypatch, signals, raw_name, command
+):
+    calls = _listeners(monkeypatch, lambda: {1500})
+    info = _node(port=5432, pid=1500, raw_name=raw_name, command=command)
+    result = scanner.free_port(info)
+    assert signals == []
+    assert calls == []
+    assert not result.ok
+    assert "every port it forwards" in result.detail
+
+
+def test_orbstack_port_is_listed_as_container(fake_run, frozen_now):
+    # OrbStack's helper holds the port; docker ps (OrbStack's API) names it
+    fake_run.outputs["lsof_listen.txt"] = fake_run.outputs["lsof_listen.txt"].replace(
+        "com.docker.backend  1500", "OrbStack\\x20Helper  1500"
+    )
+    ports = {p.port: p for p in scanner.get_listening_ports()}
+    assert ports[5432].container == "dev-postgres"
+    assert ports[5432].raw_name == "OrbStack Helper"
+
+
+def test_orbstack_container_is_stopped(monkeypatch, fake_run, signals):
+    fake_run.outputs["lsof_socket.txt"] = "p1500\ncOrbStack Helper\n"
+    stopped = lambda: fake_run.commands("docker stop")  # noqa: E731
+    _listeners(monkeypatch, lambda: set() if stopped() else {1500})
+    assert scanner.free_port(_backend(raw_name="OrbStack Helper")).ok
+    assert fake_run.commands("docker stop") == [f"docker stop {PG_ID}"]
+    assert signals == []
+
+
+def test_desktop_port_with_colima_context_stops_nothing(monkeypatch, fake_run, signals):
+    # Docker Desktop listens on :5432 while the docker CLI points at Colima,
+    # whose VM publishes 5432 too. The container IDs match because both
+    # listings came from Colima, so only the socket owner tells them apart.
+    fake_run.outputs["docker_context.txt"] = COLIMA_SOCK + "\n"
+    fake_run.outputs["lsof_socket.txt"] = "p7000\nclimactl\n"
+    _listeners(monkeypatch, lambda: {1500})
+    result = scanner.free_port(_backend())
+    assert fake_run.commands("docker stop") == []
+    assert signals == []
+    assert not result.ok
+    assert "different engine" in result.detail
+
+
+def test_docker_cli_client_on_the_socket_does_not_count(monkeypatch, fake_run, signals):
+    # A running "docker logs -f" holds the other engine's socket; its process
+    # (com.docker.cli) belongs to Docker but is not the engine
+    fake_run.outputs["docker_context.txt"] = COLIMA_SOCK + "\n"
+    fake_run.outputs["lsof_socket.txt"] = "p7000\nclimactl\np8000\nccom.docker.cli\n"
+    _listeners(monkeypatch, lambda: {1500})
+    assert not scanner.free_port(_backend()).ok
+    assert fake_run.commands("docker stop") == []
+
+
+def test_desktop_socket_held_by_sibling_backend_process(monkeypatch, fake_run, signals):
+    # Docker Desktop may run the API and the port forwarder in two
+    # com.docker.backend processes; it runs once per user, so the name is enough
+    fake_run.outputs["lsof_socket.txt"] = "p1499\nccom.docker.backend\n"
+    stopped = lambda: fake_run.commands("docker stop")  # noqa: E731
+    _listeners(monkeypatch, lambda: set() if stopped() else {1500})
+    assert scanner.free_port(_backend()).ok
+    assert fake_run.commands("docker stop") == [f"docker stop {PG_ID}"]
+
+
+def test_lima_needs_the_listening_pid_on_the_socket(monkeypatch, fake_run, signals):
+    # Two Lima instances (Colima and Rancher Desktop) both run limactl, so a
+    # name match proves nothing
+    fake_run.outputs["docker_context.txt"] = COLIMA_SOCK + "\n"
+    fake_run.outputs["lsof_socket.txt"] = "p7001\nclimactl\n"
+    _listeners(monkeypatch, lambda: {7000})
+    info = _backend(pid=7000, raw_name="limactl", command="limactl hostagent rd")
+    assert not scanner.free_port(info).ok
+    assert fake_run.commands("docker stop") == []
+
+
+def test_unreadable_socket_owner_stops_nothing(monkeypatch, fake_run, signals):
+    fake_run.outputs["lsof_socket.txt"] = ""
+    _listeners(monkeypatch, lambda: {1500})
+    assert not scanner.free_port(_backend()).ok
+    assert fake_run.commands("docker stop") == []
+
+
+def test_socket_check_resolves_symlinks(monkeypatch, fake_run, signals, tmp_path):
+    real = tmp_path / "docker.sock"
+    real.touch()
+    link = tmp_path / "link.sock"
+    link.symlink_to(real)
+    monkeypatch.setenv("DOCKER_HOST", f"unix://{link}")
+    stopped = lambda: fake_run.commands("docker stop")  # noqa: E731
+    _listeners(monkeypatch, lambda: set() if stopped() else {1500})
+    assert scanner.free_port(_backend()).ok
+    (call,) = fake_run.commands("-F pc")
+    assert call.endswith(f"-- {real.resolve()}")

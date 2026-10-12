@@ -1,19 +1,24 @@
 from __future__ import annotations
 
+import dataclasses
+import json
 from datetime import datetime
-from typing import cast
 
 from rich import box
 from rich.console import Console
 from rich.markup import escape
+from rich.padding import Padding
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from rich.tree import Tree
 
-from portwhisperer.scanner import KillResult, PortInfo, ProcessInfo
+from portwhisperer.scanner import KillResult, PortInfo, ProcessInfo, is_loopback
 
 console = Console()
+
+# The CLI turns the banner off when stdout is not a terminal or with --quiet
+_show_banner = True
 
 # Maps framework names to Rich style strings, mirroring chalk colors in display.js
 FRAMEWORK_COLORS: dict[str, str] = {
@@ -60,34 +65,26 @@ FRAMEWORK_COLORS: dict[str, str] = {
 }
 
 
-def _truncate(text: str, max_len: int) -> str:
-    """Truncate a string to max_len characters, appending ellipsis if needed.
+def set_banner(enabled: bool) -> None:
+    """Turn the banner that starts each view on or off.
 
     Parameters
     ----------
-    text : str
-        Input string to truncate.
-    max_len : int
-        Maximum allowed character length.
-
-    Returns
-    -------
-    str
-        Original string if short enough, otherwise truncated with "…".
+    enabled : bool
+        False hides the banner, e.g. when output goes to a pipe.
 
     Examples
     --------
     .. code-block:: python
 
-        _truncate("hello world", 8)  # "hello w…"
+        set_banner(sys.stdout.isatty())
     """
-    if not text:
-        return ""
-    return text if len(text) <= max_len else text[: max_len - 1] + "…"
+    global _show_banner
+    _show_banner = enabled
 
 
 def render_header() -> None:
-    """Print the Port Whisperer banner as a Rich Panel.
+    """Print the Port Whisperer banner as a Rich Panel, unless it is turned off.
 
     Examples
     --------
@@ -95,6 +92,8 @@ def render_header() -> None:
 
         render_header()
     """
+    if not _show_banner:
+        return
     content = Text()
     content.append("🔊 Port Whisperer", style="bold white")
     content.append("\n")
@@ -158,7 +157,104 @@ def format_status(status: str) -> str:
     return f"{icon} {label}"
 
 
-def display_port_table(ports: list[PortInfo], filtered: bool = False) -> None:
+def format_address(address: str | None) -> str:
+    """Return a short label for who can reach a listen address.
+
+    Parameters
+    ----------
+    address : str | None
+        Host part of the lsof NAME, e.g. ``"*"`` or ``"127.0.0.1"``.
+
+    Returns
+    -------
+    str
+        ``local`` for loopback (this machine only), ``LAN`` for all
+        interfaces, or the address itself for one network interface.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        format_address("127.0.0.1")  # "[dim]local[/]"
+        format_address("*")          # "[yellow]LAN[/]"
+    """
+    if not address:
+        return "[dim]—[/]"
+    if is_loopback(address):
+        return "[dim]local[/]"
+    if address in ("*", "0.0.0.0", "[::]"):
+        return "[yellow]LAN[/]"
+    return f"[yellow]{escape(address)}[/]"
+
+
+def _json_default(value: object) -> object:
+    """Serialise the values that :mod:`json` cannot: dataclasses and datetimes."""
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return dataclasses.asdict(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    raise TypeError(f"{type(value).__name__} is not JSON serialisable")
+
+
+def to_json(data: object, indent: int | None = 2) -> str:
+    """Turn dataclasses (or lists of them) into JSON text.
+
+    Parameters
+    ----------
+    data : object
+        A dataclass instance, a list of them, or plain JSON values.
+    indent : int | None
+        Indentation; None gives one compact line.
+
+    Returns
+    -------
+    str
+        JSON with ``datetime`` values in ISO 8601.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        to_json(get_listening_ports())
+    """
+    return json.dumps(data, indent=indent, default=_json_default)
+
+
+def display_json(data: object) -> None:
+    """Print data as JSON on stdout, with no banner and no colour.
+
+    Parameters
+    ----------
+    data : object
+        A dataclass instance, a list of them, or plain JSON values.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        display_json(get_listening_ports())
+    """
+    print(to_json(data), flush=True)
+
+
+def _cell(text: str | None, style: str) -> Text:
+    """Build a table cell that never wraps and ends in "…" when cut short.
+
+    Columns made of these cells may shrink, so they give up width first.
+    """
+    if not text:
+        return Text("—", style="dim", no_wrap=True)
+    return Text(text, style=style, no_wrap=True, overflow="ellipsis")
+
+
+def _process_label(name: str, tool: str | None) -> str:
+    """Name the tool when an interpreter runs a known one, else the process."""
+    return tool or name or "—"
+
+
+def display_port_table(
+    ports: list[PortInfo], filtered: bool = False, project: str | None = None
+) -> None:
     """Render all listening ports in a Rich table and print a summary footer.
 
     Parameters
@@ -167,6 +263,8 @@ def display_port_table(ports: list[PortInfo], filtered: bool = False) -> None:
         Ports to display.
     filtered : bool
         When True, append a ``--all`` hint to the footer.
+    project : str | None
+        Project root the ports were filtered to (``ports here``).
 
     Examples
     --------
@@ -177,36 +275,43 @@ def display_port_table(ports: list[PortInfo], filtered: bool = False) -> None:
     """
     render_header()
 
+    if project:
+        console.print(f"  [dim]Project[/] [blue]{escape(project)}[/]\n")
+
     if not ports:
+        if project:
+            console.print("[dim]  No server of this project is listening.[/]\n")
+            return
         console.print("[dim]  No active listening ports found.[/]\n")
         console.print(
             "[dim]  Start a dev server and run [/][cyan]ports[/][dim] again.[/]\n"
         )
         return
 
-    table = Table(box=box.SIMPLE_HEAVY, show_footer=False, pad_edge=False)
-    table.add_column("[bold cyan]PORT[/]")
-    table.add_column("[bold cyan]PROCESS[/]")
-    table.add_column("[bold cyan]PID[/]")
-    table.add_column("[bold cyan]PROJECT[/]")
-    table.add_column("[bold cyan]FRAMEWORK[/]")
-    table.add_column("[bold cyan]UPTIME[/]")
-    table.add_column("[bold cyan]STATUS[/]")
+    table = Table(
+        box=box.SIMPLE_HEAVY, show_footer=False, pad_edge=False, collapse_padding=True
+    )
+    # Fixed columns never wrap; PROJECT and PROCESS hold Text cells that may
+    # shrink, so they lose width first at 80 columns
+    table.add_column("[bold cyan]PORT[/]", no_wrap=True)
+    table.add_column("[bold cyan]ADDRESS[/]", no_wrap=True)
+    table.add_column("[bold cyan]PROCESS[/]", max_width=16)
+    table.add_column("[bold cyan]PID[/]", no_wrap=True)
+    table.add_column("[bold cyan]PROJECT[/]", max_width=20)
+    table.add_column("[bold cyan]FRAMEWORK[/]", no_wrap=True, overflow="ellipsis")
+    table.add_column("[bold cyan]UPTIME[/]", no_wrap=True)
+    table.add_column("[bold cyan]STATUS[/]", no_wrap=True)
 
     for p in ports:
-        project = (
-            f"[blue]{_truncate(p.project_name, 20)}[/]"
-            if p.project_name
-            else "[dim]—[/]"
-        )
         uptime = f"[yellow]{p.uptime}[/]" if p.uptime else "[dim]—[/]"
-        process = p.process_name or p.raw_name or "—"
+        process = _process_label(p.process_name or p.raw_name, p.tool)
 
         table.add_row(
             f"[bold white]:{p.port}[/]",
-            f"[white]{process}[/]",
+            format_address(p.address),
+            _cell(process, "white"),
             f"[dim]{p.pid}[/]",
-            project,
+            _cell(p.project_name, "blue"),
             format_framework(p.framework),
             uptime,
             format_status(p.status),
@@ -259,15 +364,19 @@ def display_process_table(processes: list[ProcessInfo], filtered: bool = False) 
         )
         return
 
-    table = Table(box=box.SIMPLE_HEAVY, show_footer=False, pad_edge=False)
-    table.add_column("[bold cyan]PID[/]")
-    table.add_column("[bold cyan]PROCESS[/]")
-    table.add_column("[bold cyan]CPU%[/]")
-    table.add_column("[bold cyan]MEM[/]")
-    table.add_column("[bold cyan]PROJECT[/]")
-    table.add_column("[bold cyan]FRAMEWORK[/]")
-    table.add_column("[bold cyan]UPTIME[/]")
-    table.add_column("[bold cyan]WHAT[/]")
+    table = Table(
+        box=box.SIMPLE_HEAVY, show_footer=False, pad_edge=False, collapse_padding=True
+    )
+    # Fixed columns never wrap; PROCESS, PROJECT and WHAT hold Text cells that
+    # may shrink, so they lose width first at 80 columns
+    table.add_column("[bold cyan]PID[/]", no_wrap=True)
+    table.add_column("[bold cyan]PROCESS[/]", max_width=15)
+    table.add_column("[bold cyan]CPU%[/]", no_wrap=True)
+    table.add_column("[bold cyan]MEM[/]", no_wrap=True)
+    table.add_column("[bold cyan]PROJECT[/]", max_width=20)
+    table.add_column("[bold cyan]FRAMEWORK[/]", no_wrap=True, overflow="ellipsis")
+    table.add_column("[bold cyan]UPTIME[/]", no_wrap=True)
+    table.add_column("[bold cyan]WHAT[/]", max_width=30)
 
     for p in processes:
         cpu_str = f"{p.cpu:.1f}"
@@ -280,23 +389,17 @@ def display_process_table(processes: list[ProcessInfo], filtered: bool = False) 
             cpu_cell = f"[green]{cpu_str}[/]"
 
         memory = f"[green]{p.memory}[/]" if p.memory else "[dim]—[/]"
-        project = (
-            f"[blue]{_truncate(p.project_name, 20)}[/]"
-            if p.project_name
-            else "[dim]—[/]"
-        )
         uptime = f"[yellow]{p.uptime}[/]" if p.uptime else "[dim]—[/]"
-        what = f"[dim]{_truncate(p.description or p.process_name, 30)}[/]"
 
         table.add_row(
             f"[dim]{p.pid}[/]",
-            f"[bold white]{_truncate(p.process_name, 15)}[/]",
+            _cell(_process_label(p.process_name, p.tool), "bold white"),
             cpu_cell,
             memory,
-            project,
+            _cell(p.project_name, "blue"),
             format_framework(p.framework),
             uptime,
-            what,
+            _cell(p.description or p.process_name, "dim"),
         )
 
     console.print(table)
@@ -344,9 +447,18 @@ def display_port_detail(info: PortInfo | None) -> None:
         # Pad label to 16 chars so values align vertically
         console.print(f"  [dim]{label:<16}[/] {value}")
 
-    process = info.process_name or info.raw_name or "—"
-    _row("Process", f"[bold white]{process}[/]")
+    # The interpreter stays visible here; the tables show only the tool
+    process = escape(info.raw_name or info.process_name or "—")
+    tool = f" [dim]running[/] [white]{escape(info.tool)}[/]" if info.tool else ""
+    _row("Process", f"[bold white]{process}[/]{tool}")
     _row("PID", f"[dim]{info.pid}[/]")
+    if info.address:
+        reach = (
+            "this machine only"
+            if is_loopback(info.address)
+            else "reachable from the network"
+        )
+        _row("Address", f"{escape(info.address)}:{info.port} [dim]({reach})[/]")
     _row("Status", format_status(info.status))
     _row("Framework", format_framework(info.framework))
     _row("Memory", f"[green]{info.memory}[/]" if info.memory else "[dim]—[/]")
@@ -356,6 +468,26 @@ def display_port_detail(info: PortInfo | None) -> None:
         # Format start_time just like JS's toLocaleString()
         started = info.start_time.strftime("%Y-%m-%d %H:%M:%S")
         _row("Started", f"[dim]{started}[/]")
+    if info.other_ports:
+        others = ", ".join(f":{port}" for port in info.other_ports)
+        _row("Also listens", f"[white]{others}[/]")
+    if info.command:
+        # Fold long commands instead of cutting them: this is the field that
+        # answers "what is this?"
+        grid = Table.grid(padding=(0, 1))
+        grid.add_column(width=16, style="dim")
+        grid.add_column(overflow="fold")
+        grid.add_row("Command", Text(info.command, style="white"))
+        console.print(Padding(grid, (0, 0, 0, 2)))
+
+    if info.container:
+        console.print()
+        console.print("  [bold cyan]Container[/]")
+        console.print(f"[dim]  {'─' * 22}[/]")
+        _row("Name", f"[white]{escape(info.container)}[/]")
+        _row("Image", f"[white]{escape(info.image)}[/]" if info.image else "[dim]—[/]")
+        if info.container_id:
+            _row("ID", f"[dim]{info.container_id[:12]}[/]")
 
     # Location section
     console.print()
@@ -377,20 +509,18 @@ def display_port_detail(info: PortInfo | None) -> None:
         console.print("  [bold cyan]Process Tree[/]")
         console.print(f"[dim]  {'─' * 22}[/]")
 
-        tree = Tree("")
-        # process_tree is ordered from the target PID up toward init
-        # Build nested nodes so each level is a child of the previous
-        node = tree
-        for i, entry in enumerate(info.process_tree):
-            prefix = "→" if i == 0 else "└─"
-            pid_style = "bold white" if entry["pid"] == info.pid else "dim"
-            label = (
-                f"[dim]{prefix}[/] [{pid_style}]{entry['name']}[/] "
-                f"[dim]({entry['pid']})[/]"
-            )
-            node = node.add(label)
+        # process_tree runs from the target up toward init; draw it the other
+        # way, oldest ancestor at the root and the target as the deepest leaf
+        def _label(entry: dict) -> str:
+            style = "bold white" if entry["pid"] == info.pid else "white"
+            return f"[{style}]{escape(entry['name'])}[/] [dim]({entry['pid']})[/]"
 
-        console.print("  ", tree)
+        root, *rest = reversed(info.process_tree)
+        tree = node = Tree(_label(root), guide_style="dim")
+        for entry in rest:
+            node = node.add(_label(entry))
+
+        console.print(Padding(tree, (0, 0, 0, 2), expand=False))
 
     console.print()
     console.print(f"  [dim]Kill this process: [/][cyan]ports kill {info.port}[/]")
@@ -487,42 +617,69 @@ def display_kill_results(results: list[KillResult]) -> None:
     console.print()
 
 
-def display_watch_event(event_type: str, info: PortInfo | dict[str, int]) -> None:
+def display_watch_event(event_type: str, info: PortInfo) -> None:
     """Print a single watch-mode event line with a timestamp prefix.
 
     Parameters
     ----------
     event_type : str
-        Either ``"new"`` for an opened port or ``"removed"`` for a closed one.
-    info : PortInfo | dict[str, int]
-        For ``"new"`` events, a :class:`~portwhisperer.scanner.PortInfo`.
-        For ``"removed"`` events, a dict with a ``"port"`` key.
+        ``"new"`` for an opened port, ``"restarted"`` for a new PID on the
+        same port, or ``"closed"`` for a port nobody listens on any more.
+    info : PortInfo
+        The port; for ``"closed"``, the last info seen before it closed.
 
     Examples
     --------
     .. code-block:: python
 
         display_watch_event("new", port_info)
-        display_watch_event("removed", {"port": 3000})
+        display_watch_event("closed", port_info)
     """
     timestamp = f"[dim]{datetime.now().strftime('%H:%M:%S')}[/]"
+    labels = {
+        "new": "[green]▲ NEW[/]      ",
+        "restarted": "[yellow]↻ RESTARTED[/]",
+        "closed": "[red]▼ CLOSED[/]   ",
+    }
+    console.print(f"  {timestamp} {labels[event_type]} {_watch_line(info)}")
 
-    if event_type == "new" and isinstance(info, PortInfo):
-        fw = f" {format_framework(info.framework)}" if info.framework else ""
-        proj = f" [blue][{info.project_name}][/]" if info.project_name else ""
-        console.print(
-            f"  {timestamp} [green]▲ NEW[/]    "
-            f":[bold white]{info.port}[/] ← [white]{info.process_name}[/]{proj}{fw}"
-        )
-    elif event_type == "removed":
-        removed_info = cast(dict[str, int], info)
-        console.print(
-            f"  {timestamp} [red]▼ CLOSED[/] :[bold white]{removed_info['port']}[/]"
-        )
+
+def _watch_line(info: PortInfo) -> str:
+    """Describe one port for watch output: port, address, process, project."""
+    process = escape(_process_label(info.process_name, info.tool))
+    fw = f" {format_framework(info.framework)}" if info.framework else ""
+    proj = f" [blue]\\[{escape(info.project_name)}][/]" if info.project_name else ""
+    return (
+        f":[bold white]{info.port}[/] {format_address(info.address)} "
+        f"← [white]{process}[/] [dim]({info.pid})[/]{proj}{fw}"
+    )
+
+
+def display_watch_snapshot(ports: list[PortInfo]) -> None:
+    """Print the ports that are open when ``ports watch`` starts.
+
+    Parameters
+    ----------
+    ports : list[PortInfo]
+        Ports listening at the first poll.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        display_watch_snapshot(get_listening_ports())
+    """
+    noun = "port" if len(ports) == 1 else "ports"
+    console.print(f"[bold]  Listening now ({len(ports)} {noun})[/]")
+    for p in ports:
+        console.print(f"  {_watch_line(p)}")
+    console.print()
+    console.print("[bold cyan]  Watching for changes...[/]")
+    console.print("[dim]  Press Ctrl+C to stop[/]\n")
 
 
 def display_watch_header() -> None:
-    """Print the watch-mode startup message after the header banner.
+    """Print the banner before watch mode starts.
 
     Examples
     --------
@@ -531,5 +688,28 @@ def display_watch_header() -> None:
         display_watch_header()
     """
     render_header()
-    console.print("[bold cyan]  Watching for port changes...[/]")
-    console.print("[dim]  Press Ctrl+C to stop[/]\n")
+
+
+def display_watch_json(event_type: str, data: PortInfo | list[PortInfo]) -> None:
+    """Print watch events as JSON, one object per line.
+
+    The snapshot prints one ``"snapshot"`` line per open port. Each line holds
+    the port's fields plus ``event`` and ``time`` (ISO 8601).
+
+    Parameters
+    ----------
+    event_type : str
+        ``"snapshot"``, ``"new"``, ``"restarted"`` or ``"closed"``.
+    data : PortInfo | list[PortInfo]
+        A list for ``"snapshot"``, one port otherwise.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        display_watch_json("new", port_info)
+    """
+    now = datetime.now().isoformat(timespec="seconds")
+    for info in [data] if isinstance(data, PortInfo) else data:
+        line = {"event": event_type, "time": now, **dataclasses.asdict(info)}
+        print(to_json(line, indent=None), flush=True)

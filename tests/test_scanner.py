@@ -176,7 +176,8 @@ def test_port_details(fake_run, frozen_now):
     assert info.git_branch == "main"
     # Walks up through uv and zsh, stopping where the parent is missing
     assert [p["pid"] for p in info.process_tree] == [23928, 23892, 23800]
-    assert info.process_tree[1]["name"] == "/opt/homebrew/bin/uv"
+    # Basenames, not full binary paths
+    assert [p["name"] for p in info.process_tree] == ["python3", "uv", "-zsh"]
 
 
 def test_port_details_looks_up_only_the_target(fake_run, frozen_now):
@@ -440,3 +441,239 @@ def test_clean_skips_launchd_jobs(fake_run, frozen_now):
 
 def test_launchd_pids(fake_run):
     assert scanner._launchd_pids() == {98426, 679}
+
+
+# ── listen address, tool names, detail extras (#6) ───────────────────────────
+
+
+def test_listen_address(ports):
+    assert ports[3000].address == "*"
+    assert ports[8012].address == "127.0.0.1"
+    assert ports[5000].address == "*"
+
+
+def test_widest_address_wins(fake_run, frozen_now):
+    # The IPv4 loopback row comes first, but the port is open on all interfaces
+    fake_run.outputs["lsof_listen.txt"] += (
+        "node  41000  dev  30u  IPv4 0x1  0t0  TCP 127.0.0.1:9000 (LISTEN)\n"
+        "node  41000  dev  31u  IPv6 0x2  0t0  TCP *:9000 (LISTEN)\n"
+        "node  41000  dev  32u  IPv4 0x3  0t0  TCP 127.0.0.1:9001 (LISTEN)\n"
+        "node  41000  dev  33u  IPv6 0x4  0t0  TCP [::1]:9001 (LISTEN)\n"
+    )
+    ports = {p.port: p for p in scanner.get_listening_ports()}
+    assert ports[9000].address == "*"
+    assert ports[9001].address == "127.0.0.1"
+
+
+@pytest.mark.parametrize(
+    ("address", "expected"),
+    [
+        ("127.0.0.1", True),
+        ("127.0.0.53", True),
+        ("[::1]", True),
+        ("*", False),
+        ("192.168.1.5", False),
+        (None, False),
+    ],
+)
+def test_is_loopback(address, expected):
+    assert scanner.is_loopback(address) is expected
+
+
+def test_tool_names(ports):
+    assert ports[8012].tool == "uvicorn"
+    assert ports[3000].tool == "next"
+    assert ports[8000].tool == "http.server"
+    assert ports[4000].tool is None
+    # The interpreter name stays for the detail view and the dev filter
+    assert ports[8012].process_name == "python3.13"
+
+
+@pytest.mark.parametrize(
+    ("command", "name", "expected"),
+    [
+        ("python3 /app/.venv/bin/uvicorn app:app --reload", "python3.13", "uvicorn"),
+        ("python -m flask run", "python", "flask"),
+        ("python -m mymodule", "python", None),
+        ("node /app/node_modules/vite/bin/vite.js", "node", "vite"),
+        ("node /app/node_modules/.bin/next dev", "node", "next"),
+        ("node --inspect /app/node_modules/.bin/nodemon x.js", "node", "nodemon"),
+        ("node server.js --mode vite", "node", None),
+        ("node", "node", None),
+        # A native binary already shows its own name
+        ("/usr/local/bin/vite", "vite", None),
+        ("bun /repo/node_modules/.bin/astro dev", "bun", "astro"),
+    ],
+)
+def test_detect_tool(command, name, expected):
+    assert scanner._detect_tool(command, name) == expected
+
+
+def test_all_processes_tool(processes):
+    assert processes[23928].tool == "uvicorn"
+
+
+def test_port_details_other_ports(fake_run, frozen_now):
+    info = scanner.get_port_details(5000)
+    assert info is not None
+    assert info.other_ports == [7000]
+
+
+def test_port_details_docker_has_image_and_no_other_ports(fake_run, frozen_now):
+    info = scanner.get_port_details(5432)
+    assert info is not None
+    assert info.image == "postgres:15"
+    assert info.other_ports == []
+
+
+# ── user config file (#9) ─────────────────────────────────────────────────────
+
+
+def test_config_adds_dev_process(no_user_config):
+    assert not scanner.is_dev_process("air", "air")
+    scanner._user_process_lists.cache_clear()
+    no_user_config.parent.mkdir(parents=True)
+    no_user_config.write_text('dev_processes = ["Air", "hugo"]\n')
+    assert scanner.is_dev_process("air", "air")
+    assert scanner.is_dev_process("hugo", "hugo server")
+
+
+def test_config_ignores_process_over_builtin(no_user_config):
+    no_user_config.parent.mkdir(parents=True)
+    no_user_config.write_text('ignore_processes = ["node"]\n')
+    assert not scanner.is_dev_process("node", "node server.js")
+
+
+def test_config_ignore_beats_dev(no_user_config):
+    no_user_config.parent.mkdir(parents=True)
+    no_user_config.write_text(
+        'dev_processes = ["ollama"]\nignore_processes = ["ollama"]\n'
+    )
+    assert not scanner.is_dev_process("ollama", "ollama serve")
+
+
+def test_config_can_show_a_blocked_app(no_user_config):
+    no_user_config.parent.mkdir(parents=True)
+    no_user_config.write_text('dev_processes = ["code"]\n')
+    assert scanner.is_dev_process("code", "")
+
+
+@pytest.mark.parametrize(
+    ("text", "message"),
+    [
+        ("dev_processes = [", "ignoring"),
+        ('dev_processes = "air"', "'dev_processes' must be a list of strings"),
+        ("ignore_processes = [1, 2]", "'ignore_processes' must be a list"),
+        ('dev_process = ["air"]', "unknown key 'dev_process'"),
+    ],
+)
+def test_bad_config_warns_once_and_uses_builtins(no_user_config, capsys, text, message):
+    no_user_config.parent.mkdir(parents=True)
+    no_user_config.write_text(text)
+    assert scanner.is_dev_process("node", "node x")
+    assert not scanner.is_dev_process("air", "air")
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1
+    assert message in err
+    assert str(no_user_config) in err
+
+
+def test_config_hides_port_from_default_view(fake_run, frozen_now, no_user_config):
+    no_user_config.parent.mkdir(parents=True)
+    no_user_config.write_text('ignore_processes = ["bun"]\n')
+    ports = scanner.get_listening_ports()
+    shown = [p.port for p in ports if scanner.is_dev_process(p.process_name, p.command)]
+    assert 37777 not in shown
+
+
+def test_config_respects_xdg_and_home(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "x"))
+    assert scanner._config_path() == tmp_path / "x" / "portwhisperer" / "config.toml"
+    monkeypatch.delenv("XDG_CONFIG_HOME")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert scanner._config_path() == (
+        tmp_path / ".config" / "portwhisperer" / "config.toml"
+    )
+
+
+# ── watch_ports (#7) ──────────────────────────────────────────────────────────
+
+
+def _watch(monkeypatch, polls: list[list[PortInfo]], dev_only: bool = True):
+    """Run ``watch_ports`` over a fixed series of polls and return the events."""
+    series = iter(polls)
+    monkeypatch.setattr(scanner, "get_listening_ports", lambda: next(series))
+    sleeps = iter(range(len(polls) - 1))
+
+    def fake_sleep(seconds: float) -> None:
+        if next(sleeps, None) is None:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(scanner.time, "sleep", fake_sleep)
+    events: list[tuple[str, object]] = []
+    scanner.watch_ports(lambda kind, data: events.append((kind, data)), 0.2, dev_only)
+    return [
+        (kind, [p.port for p in data] if isinstance(data, list) else data.pid)
+        for kind, data in events
+    ]
+
+
+def _p(port: int, pid: int, name: str = "node") -> PortInfo:
+    return PortInfo(port=port, pid=pid, process_name=name, raw_name=name, command="")
+
+
+def test_watch_snapshot_then_changes(monkeypatch):
+    events = _watch(
+        monkeypatch,
+        [
+            [_p(3000, 1), _p(4000, 2)],
+            [_p(3000, 1), _p(4000, 2), _p(5000, 3)],
+            [_p(3000, 1), _p(5000, 3)],
+        ],
+    )
+    assert events == [("snapshot", [3000, 4000]), ("new", 3), ("closed", 2)]
+
+
+def test_watch_detects_restart_on_same_port(monkeypatch):
+    events = _watch(monkeypatch, [[_p(3000, 1)], [_p(3000, 9)]])
+    assert events == [("snapshot", [3000]), ("restarted", 9)]
+
+
+def test_watch_filters_to_dev_processes(monkeypatch):
+    polls = [[_p(3000, 1), _p(7000, 2, "ControlCenter")], [_p(3000, 1)]]
+    assert _watch(monkeypatch, polls) == [("snapshot", [3000])]
+
+
+def test_watch_all_shows_everything(monkeypatch):
+    polls = [[_p(3000, 1), _p(7000, 2, "ControlCenter")], [_p(3000, 1)]]
+    assert _watch(monkeypatch, polls, dev_only=False) == [
+        ("snapshot", [3000, 7000]),
+        ("closed", 2),
+    ]
+
+
+# ── ports here (#8) ───────────────────────────────────────────────────────────
+
+
+def test_find_project_root_prefers_git(monkeypatch, tmp_path):
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "package.json").write_text("{}")
+
+    def run(args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, f"{tmp_path}\n", "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert scanner.find_project_root(str(tmp_path / "pkg")) == str(tmp_path.resolve())
+
+
+def test_find_project_root_without_git(monkeypatch, tmp_path):
+    (tmp_path / "pkg" / "src").mkdir(parents=True)
+    (tmp_path / "pkg" / "package.json").write_text("{}")
+
+    def run(args, **kwargs):
+        return subprocess.CompletedProcess(args, 128, "", "not a git repository")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert scanner.find_project_root(str(tmp_path / "pkg" / "src")) == str(
+        (tmp_path / "pkg").resolve()
+    )

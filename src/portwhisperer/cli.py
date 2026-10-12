@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import sys
 
@@ -8,6 +9,7 @@ from rich.console import Console
 
 from portwhisperer.display import (
     display_clean_candidates,
+    display_json,
     display_kill_results,
     display_kill_targets,
     display_port_detail,
@@ -15,11 +17,16 @@ from portwhisperer.display import (
     display_process_table,
     display_watch_event,
     display_watch_header,
+    display_watch_json,
+    display_watch_snapshot,
+    set_banner,
 )
 from portwhisperer.scanner import (
     KillResult,
+    PortInfo,
     ProcessInfo,
     find_clean_candidates,
+    find_project_root,
     free_port,
     get_all_processes,
     get_listening_ports,
@@ -43,10 +50,17 @@ class _PortGroup(click.Group):
         # If first arg isn't a subcommand or flag, try to treat it as a port number
         if args and args[0] not in self.commands and not args[0].startswith("-"):
             try:
-                int(args[0])
-                args = ["--whoisonport", args[0], *args[1:]]
+                port = int(args[0])
             except ValueError:
                 pass
+            else:
+                # Name the bad port in the user's own words, not --whoisonport's
+                if not 1 <= port <= 65535:
+                    raise click.UsageError(
+                        f"{port} is not a valid port. Use a number from 1 to 65535.",
+                        ctx,
+                    )
+                args = ["--whoisonport", args[0], *args[1:]]
         return super().parse_args(ctx, args)
 
 
@@ -61,6 +75,38 @@ def _stdin_is_tty() -> bool:
             click.confirm("Kill?")
     """
     return sys.stdin.isatty()
+
+
+def _stdout_is_tty() -> bool:
+    """Return True when output goes to a terminal, not a pipe or a file.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        set_banner(_stdout_is_tty())
+    """
+    return sys.stdout.isatty()
+
+
+def _hide_banner(ctx: click.Context, param: click.Parameter, quiet: bool) -> None:
+    """Click callback for a subcommand's ``-q``: turn the banner off."""
+    if quiet:
+        set_banner(False)
+
+
+# -q on a subcommand runs after the group has set the banner, so it wins
+quiet_option = click.option(
+    "-q",
+    "--quiet",
+    is_flag=True,
+    expose_value=False,
+    callback=_hide_banner,
+    help="Do not print the banner.",
+)
+json_option = click.option(
+    "--json", "as_json", is_flag=True, help="Print JSON instead of a table."
+)
 
 
 def _parse_memory_to_kb(memory: str | None) -> float:
@@ -174,6 +220,7 @@ def _collapse_docker(processes: list[ProcessInfo]) -> list[ProcessInfo]:
 
 
 @click.group(cls=_PortGroup, invoke_without_command=True)
+@click.version_option(package_name="portwhisperer", prog_name="portwhisperer")
 @click.option(
     "--all",
     "-a",
@@ -181,20 +228,47 @@ def _collapse_docker(processes: list[ProcessInfo]) -> list[ProcessInfo]:
     is_flag=True,
     help="Show all listening ports, not just dev servers",
 )
-@click.option("--whoisonport", type=int, help="Show details for a specific port")
+@click.option(
+    "--whoisonport",
+    type=click.IntRange(1, 65535),
+    metavar="PORT",
+    help="Show details for a specific port",
+)
+@json_option
+@click.option("-q", "--quiet", is_flag=True, help="Do not print the banner.")
 @click.pass_context
-def main(ctx: click.Context, show_all: bool, whoisonport: int | None) -> None:
-    """Port Whisperer — listen to your ports."""
+def main(
+    ctx: click.Context,
+    show_all: bool,
+    whoisonport: int | None,
+    as_json: bool,
+    quiet: bool,
+) -> None:
+    """Port Whisperer — listen to your ports.
+
+    \b
+    ports <port> exits 0 when a process listens on the port, 1 when the port
+    is free, and 2 when the argument is not a valid port.
+    """
+    # The banner is decoration for people; pipes and files get plain data
+    set_banner(not quiet and _stdout_is_tty())
     if ctx.invoked_subcommand is not None:
         return
 
     if whoisonport is not None:
         info = get_port_details(whoisonport)
+        if as_json:
+            if info:
+                display_json(info)
+            sys.exit(0 if info else 1)
         display_port_detail(info)
-        # Without a terminal nobody can answer, so never prompt (or hang)
+        if info is None:
+            sys.exit(1)
+        # Without a terminal nobody can answer, so never prompt (or hang). The
+        # prompt goes to stdout, so a redirected stdout would hide it.
         if (
-            info
-            and _stdin_is_tty()
+            _stdin_is_tty()
+            and _stdout_is_tty()
             and click.confirm(f"  Kill process on :{whoisonport}?", default=False)
         ):
             display_kill_results([free_port(info)])
@@ -204,6 +278,9 @@ def main(ctx: click.Context, show_all: bool, whoisonport: int | None) -> None:
     ports = get_listening_ports()
     if not show_all:
         ports = [p for p in ports if is_dev_process(p.process_name, p.command)]
+    if as_json:
+        display_json(ports)
+        return
     display_port_table(ports, filtered=not show_all)
 
 
@@ -215,17 +292,24 @@ def main(ctx: click.Context, show_all: bool, whoisonport: int | None) -> None:
     is_flag=True,
     help="Show all processes",
 )
-def ps(show_all: bool) -> None:
+@json_option
+@quiet_option
+def ps(show_all: bool, as_json: bool) -> None:
     """Show all running dev processes."""
     processes = get_all_processes()
 
     if not show_all:
         processes = [p for p in processes if is_dev_process(p.process_name, p.command)]
-        # Merge all Docker-family processes into one summary row
-        processes = _collapse_docker(processes)
+        # Merge all Docker-family processes into one summary row. JSON keeps
+        # them apart: the summary row's PID and command are not real.
+        if not as_json:
+            processes = _collapse_docker(processes)
 
     # Hottest processes first
     processes.sort(key=lambda p: p.cpu, reverse=True)
+    if as_json:
+        display_json(processes)
+        return
     display_process_table(processes, filtered=not show_all)
 
 
@@ -277,6 +361,7 @@ def _parse_selection(raw: str, count: int) -> list[int]:
 
 
 @main.command()
+@quiet_option
 def clean() -> None:
     """Pick detached or zombie dev servers to kill. Daemons are left alone."""
     candidates = find_clean_candidates()
@@ -337,10 +422,82 @@ def kill(port_numbers: tuple[int, ...], force: bool, yes: bool) -> None:
 @click.option(
     "--interval",
     default=2.0,
-    type=float,
-    help="Poll interval in seconds",
+    type=click.FloatRange(min=0.2),
+    show_default=True,
+    help="Poll interval in seconds (at least 0.2)",
 )
-def watch(interval: float) -> None:
-    """Monitor port changes in real-time."""
+@click.option(
+    "--all",
+    "-a",
+    "show_all",
+    is_flag=True,
+    help="Watch all listening ports, not just dev servers",
+)
+@click.option(
+    "--json", "as_json", is_flag=True, help="Print one JSON object per event."
+)
+@quiet_option
+def watch(interval: float, show_all: bool, as_json: bool) -> None:
+    """Monitor port changes in real-time.
+
+    Prints the ports open now, then one line each time a port opens, closes,
+    or is taken over by a new PID (a restart).
+    """
+    if as_json:
+        watch_ports(display_watch_json, interval=interval, dev_only=not show_all)
+        return
+
+    def on_event(event: str, data: PortInfo | list[PortInfo]) -> None:
+        if isinstance(data, PortInfo):
+            display_watch_event(event, data)
+        else:
+            display_watch_snapshot(data)
+
     display_watch_header()
-    watch_ports(display_watch_event, interval=interval)
+    watch_ports(on_event, interval=interval, dev_only=not show_all)
+
+
+@main.command("open")
+@click.argument("port", type=click.IntRange(1, 65535))
+def open_port(port: int) -> None:
+    """Open http://localhost:PORT in the default browser.
+
+    Exits 1 when nothing listens on the port.
+    """
+    if port not in {p.port for p in get_listening_ports()}:
+        console.print(f"[red]  Nothing listens on :{port}.[/]")
+        sys.exit(1)
+    click.launch(f"http://localhost:{port}")
+
+
+@main.command("next")
+@click.argument("start", type=click.IntRange(1, 65535), default=3000)
+def next_port(start: int) -> None:
+    """Print the first free TCP port at or above START (default 3000).
+
+    Only listeners that lsof can see count, which without sudo means your
+    own processes.
+    """
+    busy = {p.port for p in get_listening_ports()}
+    free = next((n for n in range(start, 65536) if n not in busy), None)
+    if free is None:
+        console.print(f"[red]  No free port from {start} to 65535.[/]")
+        sys.exit(1)
+    click.echo(free)
+
+
+@main.command()
+@quiet_option
+def here() -> None:
+    """Show the ports served from the current project.
+
+    The project is the git repository you are in, or else the nearest
+    directory with a project file such as package.json or pyproject.toml.
+    """
+    root = find_project_root(os.getcwd())
+    ports = [
+        p
+        for p in get_listening_ports()
+        if p.cwd and (p.cwd == root or p.cwd.startswith(root.rstrip("/") + "/"))
+    ]
+    display_port_table(ports, project=root)

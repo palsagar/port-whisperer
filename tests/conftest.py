@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
 
@@ -14,6 +15,7 @@ FIXTURES = Path(__file__).parent / "fixtures"
 # Most specific match first: "lsof -a -d cwd" and "lsof -w -t" must not hit the
 # LISTEN route.
 ROUTES: list[tuple[str, str]] = [
+    ("-F pc", "lsof_socket.txt"),
     ("lsof -w -t", "lsof_pids.txt"),
     ("-sTCP:LISTEN", "lsof_listen.txt"),
     ("-d cwd", "lsof_cwd.txt"),
@@ -103,6 +105,20 @@ def fake_run(monkeypatch: pytest.MonkeyPatch, project_root: Path) -> FakeRun:
     monkeypatch.delenv("DOCKER_HOST", raising=False)
     monkeypatch.delenv("DOCKER_CONTEXT", raising=False)
     return fake
+
+
+@pytest.fixture(autouse=True)
+def no_user_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Path]:
+    """Point the config lookup at an empty directory, so the developer's own
+    ``~/.config/portwhisperer/config.toml`` never changes test results.
+
+    Returns the ``config.toml`` path; tests write to it to try a config.
+    """
+    config_home = tmp_path / "xdg-config"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+    scanner._user_process_lists.cache_clear()
+    yield config_home / "portwhisperer" / "config.toml"
+    scanner._user_process_lists.cache_clear()
 
 
 class _FrozenDatetime(datetime):
