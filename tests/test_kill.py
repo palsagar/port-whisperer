@@ -375,3 +375,46 @@ def test_no_sigkill_when_the_port_cannot_be_checked(monkeypatch, signals):
     result = scanner.free_port(_node())
     assert signals == [(41000, signal.SIGTERM)]
     assert not result.ok
+
+
+# ── Docker endpoint must be local ─────────────────────────────────────────────
+
+
+def test_remote_docker_host_is_refused(monkeypatch, fake_run, signals):
+    monkeypatch.setenv("DOCKER_HOST", "tcp://db.example.com:2376")
+    _listeners(monkeypatch, lambda: {1500})
+    result = scanner.free_port(_backend())
+    assert fake_run.commands("docker stop") == []
+    assert not result.ok
+    assert "local" in result.detail
+
+
+def test_remote_docker_context_is_refused(monkeypatch, fake_run, signals):
+    fake_run.outputs["docker_context.txt"] = "ssh://me@build-box\n"
+    _listeners(monkeypatch, lambda: {1500})
+    assert not scanner.free_port(_backend()).ok
+    assert fake_run.commands("docker stop") == []
+    assert fake_run.commands("docker ps") == []
+
+
+def test_docker_calls_are_pinned_to_the_local_endpoint(monkeypatch, fake_run, signals):
+    envs: dict[str, str | None] = {}
+
+    def run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+        if args[:2] in (["docker", "ps"], ["docker", "stop"]):
+            env = kwargs.get("env") or {}
+            assert isinstance(env, dict)
+            envs[args[1]] = env.get("DOCKER_HOST")
+            assert "DOCKER_CONTEXT" not in env
+        return fake_run(args, **kwargs)
+
+    monkeypatch.setenv("DOCKER_CONTEXT", "remote")
+    monkeypatch.setenv("DOCKER_HOST", "unix:///var/run/docker.sock")
+    monkeypatch.setattr(subprocess, "run", run)
+    stopped = lambda: fake_run.commands("docker stop")  # noqa: E731
+    _listeners(monkeypatch, lambda: set() if stopped() else {1500})
+    assert scanner.free_port(_backend()).ok
+    assert envs == {
+        "ps": "unix:///var/run/docker.sock",
+        "stop": "unix:///var/run/docker.sock",
+    }

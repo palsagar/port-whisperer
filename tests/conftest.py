@@ -20,6 +20,7 @@ ROUTES: list[tuple[str, str]] = [
     ("ps -p", "ps_batch.txt"),
     ("pid=,ppid=,comm=", "ps_tree.txt"),
     ("pcpu=", "ps_all.txt"),
+    ("docker context inspect", "docker_context.txt"),
     ("docker ps", "docker_ps.txt"),
     ("docker stop", "docker_stop.txt"),
     ("docker kill", "docker_stop.txt"),
@@ -98,6 +99,9 @@ def fake_run(monkeypatch: pytest.MonkeyPatch, project_root: Path) -> FakeRun:
     """Replace ``subprocess.run`` with a :class:`FakeRun` serving the fixtures."""
     fake = FakeRun(project_root)
     monkeypatch.setattr(subprocess, "run", fake)
+    # Tests must not depend on the developer's Docker endpoint
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    monkeypatch.delenv("DOCKER_CONTEXT", raising=False)
     return fake
 
 

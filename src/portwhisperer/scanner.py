@@ -162,11 +162,17 @@ def _batch_cwd(pids: list[int]) -> dict[int, str]:
     return result
 
 
-def _batch_docker_info() -> dict[int, dict]:
+def _batch_docker_info(env: dict[str, str] | None = None) -> dict[int, dict]:
     """Single docker ps call to get container info keyed by host port.
 
     Only TCP bindings count. A port that two containers publish is left out,
     because a kill could not tell which container to stop.
+
+    Parameters
+    ----------
+    env : dict[str, str] | None
+        Environment for the docker call, to pin the endpoint. None inherits
+        the current environment.
 
     Returns
     -------
@@ -194,6 +200,7 @@ def _batch_docker_info() -> dict[int, dict]:
             capture_output=True,
             text=True,
             timeout=5,
+            env=env,
         )
         for line in proc.stdout.splitlines():
             if not line.strip():
@@ -1388,6 +1395,56 @@ def _port_free_result(info: PortInfo, before: set[int] | None = None) -> KillRes
     )
 
 
+def _local_docker_env() -> dict[str, str] | None:
+    """Return an environment pinned to the Docker endpoint, if it is local.
+
+    The endpoint comes from ``DOCKER_HOST`` or else the active docker context.
+    Only a ``unix://`` socket is local. A remote daemon's containers can
+    publish the same port numbers as local listeners, so stopping one of them
+    would hit the wrong machine.
+
+    Returns
+    -------
+    dict[str, str] | None
+        A copy of the environment with ``DOCKER_HOST`` set to the local socket
+        and ``DOCKER_CONTEXT`` removed, or None when the endpoint is not local
+        or cannot be found.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        env = _local_docker_env()
+        if env:
+            subprocess.run(["docker", "ps"], env=env)
+    """
+    host = os.environ.get("DOCKER_HOST")
+    if not host:
+        try:
+            proc = subprocess.run(
+                [
+                    "docker",
+                    "context",
+                    "inspect",
+                    "--format",
+                    "{{.Endpoints.docker.Host}}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return None
+        if proc.returncode != 0:
+            return None
+        host = proc.stdout.strip()
+    if not host.startswith("unix://"):
+        return None
+    env = {k: v for k, v in os.environ.items() if k != "DOCKER_CONTEXT"}
+    env["DOCKER_HOST"] = host
+    return env
+
+
 def _stop_container(info: PortInfo, force: bool) -> KillResult:
     """Stop the Docker container behind a port, then check that the port is free.
 
@@ -1417,8 +1474,18 @@ def _stop_container(info: PortInfo, force: bool) -> KillResult:
     before = _port_listener_pids(info.port)
     if before is None or info.pid not in before:
         return _port_free_result(info, before)
+    env = _local_docker_env()
+    if env is None:
+        return KillResult(
+            info.port,
+            info.pid,
+            False,
+            "Docker is not using a local socket (check DOCKER_HOST and "
+            "docker context), so the container behind this port cannot be "
+            "confirmed. Nothing was stopped",
+        )
     # Compare full IDs: a recreated container can reuse the old name
-    current = _batch_docker_info().get(info.port)
+    current = _batch_docker_info(env).get(info.port)
     if current is None or current["id"] != info.container_id:
         now = f"now {current['name']}" if current else "now unknown"
         return KillResult(
@@ -1437,6 +1504,7 @@ def _stop_container(info: PortInfo, force: bool) -> KillResult:
             capture_output=True,
             text=True,
             timeout=30,
+            env=env,
         )
     except FileNotFoundError:
         return KillResult(info.port, info.pid, False, "the docker CLI is not found")
