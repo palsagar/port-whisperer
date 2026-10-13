@@ -5,10 +5,13 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import time
+import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import cache
 from pathlib import Path
 
 
@@ -31,6 +34,10 @@ class PortInfo:
     ppid: int | None = None
     container: str | None = None  # Docker container name for container ports
     container_id: str | None = None  # full ID; kills target this, not the name
+    address: str | None = None  # listen address from lsof: "*", "127.0.0.1", "[::1]"
+    tool: str | None = None  # tool run by an interpreter, e.g. "uvicorn" for python
+    image: str | None = None  # Docker image for container ports
+    other_ports: list[int] = field(default_factory=list)  # same PID; detail only
 
 
 @dataclass
@@ -45,6 +52,15 @@ class ProcessInfo:
     project_name: str | None = None
     framework: str | None = None
     uptime: str | None = None
+    tool: str | None = None  # tool run by an interpreter, e.g. "vite" for node
+
+
+class ScanError(RuntimeError):
+    """Raised when ``lsof`` cannot list the listening ports.
+
+    An empty list would claim that every port is free, so callers that act
+    on "free" (``ports <port>``, ``ports next``) must see the failure.
+    """
 
 
 # ── private helpers ───────────────────────────────────────────────────────────
@@ -645,7 +661,9 @@ def _get_process_tree(pid: int) -> list[dict]:
                 continue
             p = int(parts[0])
             pp = int(parts[1])
-            processes[p] = {"pid": p, "ppid": pp, "name": " ".join(parts[2:])}
+            # comm is the full binary path on macOS; the basename is enough
+            name = os.path.basename(" ".join(parts[2:]))
+            processes[p] = {"pid": p, "ppid": pp, "name": name}
 
         current_pid = pid
         depth = 0
@@ -734,13 +752,223 @@ def _decode_lsof_name(name: str) -> str:
     return re.sub(r"\\x([0-9a-fA-F]{2})", _unescape, name)
 
 
+# Interpreters whose process name hides the tool they run
+_INTERPRETERS = {"node", "bun", "deno", "ruby"}
+
+# Tools worth naming in the PROCESS column instead of the interpreter
+_KNOWN_TOOLS = {
+    "uvicorn",
+    "gunicorn",
+    "hypercorn",
+    "daphne",
+    "granian",
+    "fastapi",
+    "flask",
+    "celery",
+    "streamlit",
+    "jupyter",
+    "jupyter-lab",
+    "http.server",
+    "mkdocs",
+    "vite",
+    "next",
+    "nuxt",
+    "astro",
+    "remix",
+    "webpack",
+    "webpack-dev-server",
+    "esbuild",
+    "parcel",
+    "gatsby",
+    "tsx",
+    "ts-node",
+    "nodemon",
+    "vitest",
+    "jest",
+    "storybook",
+    "wrangler",
+    "serve",
+    "http-server",
+    "ng",
+    "rails",
+    "puma",
+}
+
+
+def _detect_tool(command: str, process_name: str) -> str | None:
+    """Return the known tool that an interpreter runs, from its command line.
+
+    Only the script (or ``-m`` module) right after the interpreter counts, so
+    an argument such as ``--port vite`` never names the tool.
+
+    Parameters
+    ----------
+    command : str
+        Full command string.
+    process_name : str
+        Process name; only interpreters (node, python, ...) are inspected.
+
+    Returns
+    -------
+    str | None
+        Tool name such as ``"uvicorn"`` or ``"vite"``, or None.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        _detect_tool("python3 .venv/bin/uvicorn app:app", "python3.13")  # "uvicorn"
+        _detect_tool("node node_modules/vite/bin/vite.js", "node")       # "vite"
+    """
+    name = (process_name or "").lower()
+    if name not in _INTERPRETERS and not _PYTHON_RE.fullmatch(name):
+        return None
+    parts = (command or "").split()[1:]  # skip the interpreter itself
+    for i, part in enumerate(parts):
+        if part == "-m" and i + 1 < len(parts):
+            module = parts[i + 1]
+            return module if module in _KNOWN_TOOLS else None
+        if part.startswith("-"):
+            continue
+        # node_modules/<package>/bin/x.js names the package being run
+        package = re.search(r"node_modules/(?!\.bin/)((?:@[^/]+/)?[^/]+)/", part)
+        script = re.sub(r"\.(c|m)?js$|\.py$|\.ts$", "", os.path.basename(part))
+        for candidate in (script, package.group(1) if package else None):
+            if candidate in _KNOWN_TOOLS:
+                return candidate
+        return None
+    return None
+
+
+def _address_rank(address: str) -> int:
+    """Rank a listen address by how widely it can be reached.
+
+    Parameters
+    ----------
+    address : str
+        Host part of an lsof NAME, e.g. ``"*"``, ``"127.0.0.1"`` or ``"[::1]"``.
+
+    Returns
+    -------
+    int
+        2 for all interfaces, 1 for one network address, 0 for loopback.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        _address_rank("*")          # 2
+        _address_rank("127.0.0.1")  # 0
+    """
+    if address in ("*", "0.0.0.0", "[::]"):
+        return 2
+    if is_loopback(address):
+        return 0
+    return 1
+
+
+def is_loopback(address: str | None) -> bool:
+    """Return True when a listen address is reachable from this machine only.
+
+    Parameters
+    ----------
+    address : str | None
+        Host part of an lsof NAME, e.g. ``"127.0.0.1"`` or ``"[::1]"``.
+
+    Returns
+    -------
+    bool
+        True for 127.0.0.0/8, ``::1`` and ``localhost``.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        is_loopback("127.0.0.1")  # True
+        is_loopback("*")          # False
+    """
+    if not address:
+        return False
+    return address.startswith("127.") or address in ("[::1]", "localhost")
+
+
+def _config_path() -> Path:
+    """Return the user config file path, honouring ``XDG_CONFIG_HOME``.
+
+    Returns
+    -------
+    Path
+        ``$XDG_CONFIG_HOME/portwhisperer/config.toml``, or
+        ``~/.config/portwhisperer/config.toml`` when the variable is unset.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        print(_config_path())
+    """
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return Path(base) / "portwhisperer" / "config.toml"
+
+
+@cache
+def _user_process_lists() -> tuple[frozenset[str], frozenset[str]]:
+    """Read the dev and ignored process names from the user config file.
+
+    The file is optional. When it holds invalid TOML, an unknown key, or a
+    value that is not a list of strings, one warning goes to stderr and the
+    whole file is ignored. The result is cached for the life of the process.
+
+    Returns
+    -------
+    tuple[frozenset[str], frozenset[str]]
+        Lower-cased ``dev_processes`` and ``ignore_processes``.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        dev, ignored = _user_process_lists()
+    """
+    empty: tuple[frozenset[str], frozenset[str]] = (frozenset(), frozenset())
+    path = _config_path()
+    try:
+        data = tomllib.loads(path.read_text())
+    except FileNotFoundError:
+        return empty
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        print(f"portwhisperer: ignoring {path}: {exc}", file=sys.stderr)
+        return empty
+
+    keys = ("dev_processes", "ignore_processes")
+    unknown = sorted(set(data) - set(keys))
+    bad = [
+        k
+        for k in keys
+        if k in data
+        and not (isinstance(data[k], list) and all(isinstance(v, str) for v in data[k]))
+    ]
+    if unknown or bad:
+        problem = (
+            f"unknown key {unknown[0]!r}"
+            if unknown
+            else f"{bad[0]!r} must be a list of strings"
+        )
+        print(f"portwhisperer: ignoring {path}: {problem}", file=sys.stderr)
+        return empty
+    dev, ignored = (frozenset(v.lower() for v in data.get(k, [])) for k in keys)
+    return dev, ignored
+
+
 # ── public API ────────────────────────────────────────────────────────────────
 
 
 def is_dev_process(name: str, command: str) -> bool:
     """Return True if the process looks like a dev server rather than a system app.
 
-    Used for detached-process detection and filtering the table view.
+    Used for detached-process detection and filtering the table view. Names in
+    the user config file (``ignore_processes``, then ``dev_processes``) win
+    over the built-in lists.
 
     Parameters
     ----------
@@ -763,6 +991,17 @@ def is_dev_process(name: str, command: str) -> bool:
     """
     n = (name or "").lower()
     cmd = (command or "").lower()
+
+    # The user's own lists come first, so they can correct any built-in entry
+    # The user's names may be the tool the tables show (uvicorn) or the
+    # process itself (python3.13)
+    user_dev, user_ignored = _user_process_lists()
+    if user_dev or user_ignored:
+        names = {n, (_detect_tool(command, name) or "").lower()} - {""}
+        if names & user_ignored:
+            return False
+        if names & user_dev:
+            return True
 
     # Known system/desktop apps — not dev processes
     system_apps = [
@@ -890,6 +1129,11 @@ def get_listening_ports() -> list[PortInfo]:
     list[PortInfo]
         Ports sorted by port number ascending.
 
+    Raises
+    ------
+    ScanError
+        When ``lsof`` is missing, times out, or reports an error.
+
     Examples
     --------
     .. code-block:: python
@@ -899,25 +1143,31 @@ def get_listening_ports() -> list[PortInfo]:
     """
     try:
         proc = subprocess.run(
-            # +c 0 stops lsof from cutting process names to 9 characters
-            ["lsof", "+c", "0", "-iTCP", "-sTCP:LISTEN", "-P", "-n"],
+            # +c 0 stops lsof from cutting process names to 9 characters;
+            # -w hides harmless warnings, so anything on stderr is a real error
+            ["lsof", "-w", "+c", "0", "-iTCP", "-sTCP:LISTEN", "-P", "-n"],
             capture_output=True,
             text=True,
             timeout=10,
         )
-        raw = proc.stdout
-    except (
-        subprocess.TimeoutExpired,
-        subprocess.CalledProcessError,
-        FileNotFoundError,
-    ):
-        return []
+    except FileNotFoundError as exc:
+        raise ScanError("lsof is not installed") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ScanError("lsof did not answer within 10 seconds") from exc
+    raw = proc.stdout
+    # Exit 0 is a full scan, and exit 1 with no output at all means "no
+    # listener". Anything else (an error, a signal, partial output) may hide
+    # busy ports, so it must not pass for a scan.
+    no_match = proc.returncode == 1 and not raw.strip() and not proc.stderr.strip()
+    if proc.returncode != 0 and not no_match:
+        error = re.sub(r"[\x00-\x1f\x7f]", " ", proc.stderr.strip())
+        raise ScanError(f"lsof failed: {error or f'exit code {proc.returncode}'}")
 
     lines = raw.strip().splitlines()
     if not lines:
         return []
 
-    port_map: dict[int, bool] = {}
+    by_port: dict[int, dict] = {}
     entries: list[dict] = []
 
     for line in lines[1:]:  # skip header
@@ -929,16 +1179,27 @@ def get_listening_ports() -> list[PortInfo]:
         pid = int(parts[1])
         name_field = parts[8]
 
-        m = re.search(r":(\d+)$", name_field)
+        m = re.search(r"^(.*):(\d+)$", name_field)
         if not m:
             continue
-        port = int(m.group(1))
+        address, port = m.group(1), int(m.group(2))
 
-        # Keep only first entry per port
-        if port in port_map:
+        # Keep the first entry per port, with the widest address among that
+        # PID's rows (IPv4 and IPv6). Another PID's address is not its own.
+        if port in by_port:
+            entry = by_port[port]
+            if entry["pid"] == pid and _address_rank(address) > _address_rank(
+                entry["address"]
+            ):
+                entry["address"] = address
             continue
-        port_map[port] = True
-        entries.append({"port": port, "pid": pid, "process_name": process_name})
+        by_port[port] = {
+            "port": port,
+            "pid": pid,
+            "process_name": process_name,
+            "address": address,
+        }
+        entries.append(by_port[port])
 
     # Deduplicate PIDs for batch calls
     unique_pids = list({e["pid"] for e in entries})
@@ -946,10 +1207,12 @@ def get_listening_ports() -> list[PortInfo]:
     ps_map = _batch_ps_info(unique_pids)
     cwd_map = _batch_cwd(unique_pids)
 
-    # Only call docker if we actually have docker processes in the list
+    def _command(pid: int) -> str:
+        return ps_map[pid]["command"] if pid in ps_map else ""
+
+    # Only call docker if a container engine holds one of the ports
     has_docker = any(
-        e["process_name"].startswith("com.docke") or e["process_name"] == "docker"
-        for e in entries
+        container_engine(e["process_name"], _command(e["pid"])) for e in entries
     )
     docker_map = _batch_docker_info() if has_docker else {}
 
@@ -968,6 +1231,7 @@ def get_listening_ports() -> list[PortInfo]:
             process_name=process_name,
             raw_name=process_name,
             command=ps["command"] if ps else "",
+            address=entry["address"],
         )
 
         # Status and uptime from batched ps
@@ -997,15 +1261,19 @@ def get_listening_ports() -> list[PortInfo]:
             info.framework = _detect_framework_from_command(ps["command"], process_name)
 
         # Docker container overrides
-        # Only Docker's own listener stands for a container. A native server
+        # Only a container engine's listener stands for a container. A native server
         # that shares the port number must not inherit the container's name.
-        docker = docker_map.get(port) if is_docker_process(process_name) else None
+        engine = container_engine(process_name, info.command)
+        docker = docker_map.get(port) if engine else None
         if docker:
             info.project_name = docker["name"]
             info.container = docker["name"]
             info.container_id = docker["id"]
+            info.image = docker["image"] or None
             info.framework = _detect_framework_from_image(docker["image"])
             info.process_name = "docker"
+        else:
+            info.tool = _detect_tool(info.command, process_name)
 
         # cwd + project + framework from batched lsof (skip if docker already set)
         if cwd and not docker:
@@ -1116,6 +1384,7 @@ def get_all_processes() -> list[ProcessInfo]:
                 pass
 
         info.framework = _detect_framework_from_command(e["command"], e["process_name"])
+        info.tool = _detect_tool(e["command"], e["process_name"])
 
         cwd = cwd_map.get(e["pid"])
         if cwd:
@@ -1150,12 +1419,19 @@ def get_port_details(port: int) -> PortInfo | None:
         if details:
             print(details.framework, details.git_branch)
     """
-    for info in get_listening_ports():
+    ports = get_listening_ports()
+    for info in ports:
         if info.port == port:
             # Only the requested port pays for the git and process tree lookups
             if info.cwd:
                 info.git_branch = _get_git_branch(info.cwd)
             info.process_tree = _get_process_tree(info.pid)
+            # Docker's listener holds every container port, so "other ports"
+            # would list unrelated containers
+            if not info.container:
+                info.other_ports = [
+                    p.port for p in ports if p.pid == info.pid and p.port != port
+                ]
             return info
     return None
 
@@ -1275,6 +1551,60 @@ def is_docker_process(name: str) -> bool:
         or name.startswith("Docker")
         or name in ("docker", "docker-sandbox")
     )
+
+
+# Process names that container_engine can classify only with the command line
+_NEEDS_COMMAND = {"ssh"}
+
+
+def container_engine(name: str, command: str = "") -> str | None:
+    """Name the container engine that a process belongs to, if any.
+
+    Container engines forward published ports from a VM through one host
+    process. Signalling that process drops every port it forwards, so the kill
+    path must recognise all of them, not only Docker Desktop.
+
+    Parameters
+    ----------
+    name : str
+        Process name.
+    command : str
+        Full command string. Needed to tell Lima's ``ssh`` forwarder from an
+        ordinary ssh tunnel.
+
+    Returns
+    -------
+    str | None
+        ``"Docker"``, ``"OrbStack"``, ``"Lima"`` (Colima uses Lima),
+        ``"Rancher Desktop"`` or ``"Podman"``; None for other processes.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        container_engine("OrbStack Helper")  # "OrbStack"
+        container_engine("ssh", "ssh -F /Users/me/.colima/_lima/colima/ssh.config")
+        # "Lima"
+    """
+    if is_docker_process(name) or name.startswith("vpnkit"):
+        return "Docker"
+    if name.startswith("OrbStack"):
+        return "OrbStack"
+    if name.startswith("Rancher Desktop"):
+        return "Rancher Desktop"
+    if name == "limactl":
+        return "Lima"
+    if name == "gvproxy":
+        return "Podman"
+    # Lima (and so Colima and Rancher Desktop) forwards over ssh using files in
+    # the instance directory: ControlPath=~/.lima/default/ssh.sock, an ssh
+    # master shown as "ssh: .../ssh.sock [mux]", or an older -F ssh.config.
+    # Rancher's directory is ~/Library/Application Support/rancher-desktop/lima.
+    if name == "ssh" and re.search(
+        r"lima\S*/ssh\.(sock|config)|/\.colima/", command, re.I
+    ):
+        return "Lima"
+    return None
 
 
 def _port_listener_pids(port: int) -> set[int] | None:
@@ -1445,6 +1775,102 @@ def _local_docker_env() -> dict[str, str] | None:
     return env
 
 
+def _socket_holders(path: str) -> dict[int, str] | None:
+    """Return the processes that hold a Unix socket file open.
+
+    Parameters
+    ----------
+    path : str
+        Path of the socket file. lsof matches a Unix socket by the path it was
+        bound with, so both this path and its resolved form are checked.
+
+    Returns
+    -------
+    dict[int, str] | None
+        Mapping of PID → process name, or None when ``lsof`` could not run.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        _socket_holders("/Users/me/.docker/run/docker.sock")
+        # {1500: "com.docker.backend"}
+    """
+    try:
+        proc = subprocess.run(
+            # -F pc prints "p<pid>" and "c<name>" lines; +c 0 keeps full names
+            [
+                "lsof",
+                "-w",
+                "+c",
+                "0",
+                "-F",
+                "pc",
+                "--",
+                *dict.fromkeys([path, os.path.realpath(path)]),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    holders: dict[int, str] = {}
+    pid: int | None = None
+    for line in proc.stdout.splitlines():
+        if line.startswith("p") and line[1:].isdigit():
+            pid = int(line[1:])
+        elif line.startswith("c") and pid is not None:
+            holders[pid] = _decode_lsof_name(line[1:])
+    return holders
+
+
+# Engines that run at most once per user, so their process name identifies them
+_SINGLE_INSTANCE_ENGINES = {"Docker", "OrbStack"}
+
+
+def _endpoint_serves_listener(info: PortInfo, host: str) -> bool:
+    """Return True when the Docker endpoint belongs to the engine on the port.
+
+    Two engines can run at once, e.g. Docker Desktop and Colima, and both can
+    publish the same port number. ``docker stop`` must only go to the engine
+    whose process actually listens on the macOS port. The link holds when:
+
+    - the listening process holds the endpoint's socket open, or
+    - the engine runs once per user (Docker Desktop, OrbStack) and a process
+      with the listener's exact name holds the socket. Matching the exact
+      name keeps docker CLI clients (``com.docker.cli``) from counting.
+
+    Lima (and so Colima and Rancher Desktop) can run several instances, so it
+    needs the PID match.
+
+    Parameters
+    ----------
+    info : PortInfo
+        The container port about to be freed.
+    host : str
+        The endpoint, a ``unix://`` URL.
+
+    Returns
+    -------
+    bool
+        False when the link cannot be shown.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        _endpoint_serves_listener(info, "unix:///Users/me/.docker/run/docker.sock")
+    """
+    holders = _socket_holders(host.removeprefix("unix://"))
+    if not holders:
+        return False
+    if info.pid in holders:
+        return True
+    engine = container_engine(info.raw_name, info.command)
+    return engine in _SINGLE_INSTANCE_ENGINES and info.raw_name in holders.values()
+
+
 def _stop_container(info: PortInfo, force: bool) -> KillResult:
     """Stop the Docker container behind a port, then check that the port is free.
 
@@ -1483,6 +1909,17 @@ def _stop_container(info: PortInfo, force: bool) -> KillResult:
             "Docker is not using a local socket (check DOCKER_HOST and "
             "docker context), so the container behind this port cannot be "
             "confirmed. Nothing was stopped",
+        )
+    engine = container_engine(info.raw_name, info.command) or "the container engine"
+    if not _endpoint_serves_listener(info, env["DOCKER_HOST"]):
+        return KillResult(
+            info.port,
+            info.pid,
+            False,
+            f"could not confirm that the docker endpoint ({env['DOCKER_HOST']}) "
+            f"belongs to {engine}, which holds :{info.port}. Nothing was "
+            "stopped. If you run two engines, switch with docker context use; "
+            "otherwise stop the container with docker stop",
         )
     # Compare full IDs: a recreated container can reuse the old name
     current = _batch_docker_info(env).get(info.port)
@@ -1527,9 +1964,11 @@ def _stop_container(info: PortInfo, force: bool) -> KillResult:
 def free_port(info: PortInfo, force: bool = False) -> KillResult:
     """Stop whatever listens on a port and report success only once it is free.
 
-    - A Docker container port runs ``docker stop`` (or ``docker kill`` with
-      ``force``). Docker's own processes never receive a signal, because that
-      would stop every container.
+    - A container port runs ``docker stop`` (or ``docker kill`` with
+      ``force``), but only after the docker endpoint is shown to belong to
+      the engine that listens on the port. The processes of a container
+      engine (Docker Desktop, OrbStack, Colima, ...) never receive a signal,
+      because that would drop every port they forward.
     - A zombie has already exited, so it gets no signal. Only its parent can
       remove it.
     - Any other process gets SIGTERM, then SIGKILL if it still holds the port
@@ -1565,14 +2004,29 @@ def free_port(info: PortInfo, force: bool = False) -> KillResult:
         )
     if info.container:
         return _stop_container(info, force)
-    if is_docker_process(info.raw_name):
+    command = info.command
+    if not command and info.raw_name in _NEEDS_COMMAND:
+        # The batched ps call failed for this PID. Without the command line a
+        # Lima ssh forwarder looks like any ssh tunnel, so ask again.
+        command = _batch_ps_info([info.pid]).get(info.pid, {}).get("command", "")
+        if not command:
+            return KillResult(
+                info.port,
+                info.pid,
+                False,
+                f"could not read the command line of PID {info.pid} "
+                f"({info.raw_name}), so it may be a container engine's port "
+                "forwarder. Nothing was signalled",
+            )
+    engine = container_engine(info.raw_name, command)
+    if engine:
         return KillResult(
             info.port,
             info.pid,
             False,
-            f"PID {info.pid} is Docker's own process; signalling it would stop "
-            "every container. No container was found for this port (is the "
-            "docker CLI installed?)",
+            f"PID {info.pid} is {engine}'s own process; signalling it would drop "
+            "every port it forwards. No container was found for this port (is "
+            "the docker CLI installed and pointed at this engine?)",
         )
 
     # Signal only a PID that still holds the port. After a long prompt the
@@ -1607,18 +2061,29 @@ def free_port(info: PortInfo, force: bool = False) -> KillResult:
     return _port_free_result(info, before)
 
 
-def watch_ports(callback: Callable, interval: float = 2.0) -> None:
+def watch_ports(
+    callback: Callable[[str, PortInfo | list[PortInfo]], None],
+    interval: float = 2.0,
+    dev_only: bool = True,
+) -> None:
     """Poll listening ports and invoke callback on changes.
 
-    Runs indefinitely until ``KeyboardInterrupt``.
+    Each port is tracked with its PID, so a server that restarts on the same
+    port between two polls is reported. Runs until ``KeyboardInterrupt``.
 
     Parameters
     ----------
-    callback : Callable
-        Called with ``("new", PortInfo)`` for new ports and
-        ``("removed", {"port": int})`` for removed ports.
+    callback : Callable[[str, PortInfo | list[PortInfo]], None]
+        Called once with ``("snapshot", list[PortInfo])`` for the ports open
+        at the start, then with ``("new", PortInfo)``,
+        ``("restarted", PortInfo)`` (same port, new PID or container) or
+        ``("closed", PortInfo)`` (the last info seen for that port). A failed
+        scan after the first one is skipped; the first one raises
+        :class:`ScanError`.
     interval : float
         Polling interval in seconds (default: 2.0).
+    dev_only : bool
+        Track only dev processes, as the default ``ports`` view does.
 
     Examples
     --------
@@ -1627,29 +2092,78 @@ def watch_ports(callback: Callable, interval: float = 2.0) -> None:
         def on_change(event, data):
             print(event, data)
 
-        watch_ports(on_change)
+        watch_ports(on_change, dev_only=False)
     """
-    previous_ports: set[int] = set()
 
-    def check() -> None:
-        nonlocal previous_ports
-        current = get_listening_ports()
-        current_set = {p.port for p in current}
+    def poll() -> dict[int, PortInfo]:
+        ports = get_listening_ports()
+        if dev_only:
+            ports = [p for p in ports if is_dev_process(p.process_name, p.command)]
+        return {p.port: p for p in ports}
 
-        for p in current:
-            if p.port not in previous_ports:
-                callback("new", p)
-
-        for port in previous_ports:
-            if port not in current_set:
-                callback("removed", {"port": port})
-
-        previous_ports = current_set
-
-    check()
+    previous = poll()
+    callback("snapshot", list(previous.values()))
     try:
         while True:
             time.sleep(interval)
-            check()
+            try:
+                current = poll()
+            except ScanError:
+                # A failed scan says nothing about the ports; try again on
+                # the next tick instead of reporting every port as closed
+                continue
+            for port, info in current.items():
+                if port not in previous:
+                    callback("new", info)
+                # A container port keeps the engine's PID, so a recreated
+                # container shows up only as a new container ID
+                elif (previous[port].pid, previous[port].container_id) != (
+                    info.pid,
+                    info.container_id,
+                ):
+                    callback("restarted", info)
+            for port, info in previous.items():
+                if port not in current:
+                    callback("closed", info)
+            previous = current
     except KeyboardInterrupt:
         pass
+
+
+def find_project_root(directory: str) -> str:
+    """Return the project that ``directory`` belongs to, for ``ports here``.
+
+    The git work tree wins, so a monorepo counts as one project. Outside git,
+    the nearest directory with a project marker (``package.json``,
+    ``pyproject.toml``, ...) is used.
+
+    Parameters
+    ----------
+    directory : str
+        Starting directory, usually the current one.
+
+    Returns
+    -------
+    str
+        Absolute path with symlinks resolved, to match the paths lsof reports.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        find_project_root(os.getcwd())  # "/Users/me/projects/webapp"
+    """
+    directory = os.path.realpath(directory)
+    try:
+        proc = subprocess.run(
+            ["git", "-C", directory, "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        top = proc.stdout.strip()
+        if proc.returncode == 0 and top:
+            return os.path.realpath(top)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    return _find_project_root(directory)
